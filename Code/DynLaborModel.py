@@ -240,8 +240,6 @@ class UIEmploymentModelClass(EconModelClass):
 
         dU_next_E = np.minimum(par.dU_grid + par.zeta, par.Ubar).astype(np.int32)
 
-
-
         for ik in range(par.Nk):
             ib_sep = par.ib_sep_by_ik[ik]
             ike = ik_next_E[ik]
