@@ -129,7 +129,10 @@ class FullLaborModelClass(EconModelClass):
         # Medical documentation check at spell entry (binary: accept / reject).
         # Rejected workers (ir=2) get b_floor and immediately prefer to return to UI.
         # Healthy workers (high h) face a higher rejection probability.
-        par.delta0_doc = -0.20
+        # delta0_doc must be large enough so even low-health workers face meaningful
+        # rejection risk — otherwise it has no effect on the gaming workers
+        # (who are low-health and have the highest search-cost burden from s_bar).
+        par.delta0_doc =  0.15
         par.delta1_doc =  0.50
         par.delta2_doc =  0.00
 
@@ -499,10 +502,9 @@ class FullLaborModelClass(EconModelClass):
                             continue
                         if sol.g_E[t0, ih, ik, idU, itype] >= 0.5:
                             for ih2 in range(par.Nh):
-                                pd_out = par.p_doc_out[ih2]
-                                ph = par.P_h[ih, ih2] * m
-                                cohort0[ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype] += ph * (1.0 - pd_out)
-                                cohort0[ih2, ik_E, idU_E, 0, 2, 1, ib_sep_E, itype] += ph * pd_out
+                                # only accepted workers (1-p_doc_out) enter the cohort
+                                ph = par.P_h[ih, ih2] * m * (1.0 - par.p_doc_out[ih2])
+                                cohort0[ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype] += ph
 
         # from U (g_U=1): enter S with dS=0, ir=0, io=0, ib=current ib
         muU_t0 = sim.muU[t0]
@@ -518,10 +520,9 @@ class FullLaborModelClass(EconModelClass):
                                 continue
                             if sol.g_U[t0, ih, ik, idU, ib, itype] >= 0.5:
                                 for ih2 in range(par.Nh):
-                                    pd_out = par.p_doc_out[ih2]
-                                    ph = par.P_h[ih, ih2] * m
-                                    cohort0[ih2, ik_U, idU_U, 0, 0, 0, ib, itype] += ph * (1.0 - pd_out)
-                                    cohort0[ih2, ik_U, idU_U, 0, 2, 0, ib, itype] += ph * pd_out
+                                    # only accepted workers (1-p_doc_out) enter the cohort
+                                    ph = par.P_h[ih, ih2] * m * (1.0 - par.p_doc_out[ih2])
+                                    cohort0[ih2, ik_U, idU_U, 0, 0, 0, ib, itype] += ph
         return cohort0
 
     # ── hazard: U → S ────────────────────────────────────────────────────────
@@ -666,9 +667,11 @@ def _solve_backward(
                         for idS in range(NdS):
                             idS_nxt = dS_next_S[idS]
                             for ir in range(Nr):
-                                # ir=1 (reassess-low) only exists after reassessment;
-                                # ir=0 and ir=2 (rejected-at-entry) are valid pre-reassessment.
-                                if idS < t_reassess and ir == 1:
+                                # Only ir=0 exists before reassessment.
+                                # ir=1 (low) and ir=2 (welfare) arise only at reassessment.
+                                # Rejected-at-entry workers never enter sick leave — they
+                                # stay in their prior state (E or U).
+                                if idS < t_reassess and ir > 0:
                                     continue
                                 for io in range(No):
                                     for ib in range(Nb):
@@ -753,16 +756,18 @@ def _solve_backward(
                                 + sigma_sep        * VU[t+1, ih2, ik_E, idU_E, ib_sep_E, itype]
                             )
 
-                        # EV: go sick → VS with medical check at entry.
-                        # With prob (1-p_doc_out): accepted → ir=0 (full benefit).
-                        # With prob p_doc_out:     rejected → ir=2 (b_floor).
+                        # EV: try going sick → medical check fires at transition.
+                        # Accepted (prob 1-p_doc_out): enter S (dS=0, ir=0, io=1).
+                        # Rejected (prob p_doc_out):   stay in E (exog. sep still applies).
                         EV_sick = 0.0
                         for ih2 in range(Nh):
                             p = P_h[ih, ih2]
                             pd_out = p_doc_out[ih2]
+                            EV_stay_E = ((1.0 - sigma_sep) * VE[t+1, ih2, ik_E, idU_E, itype]
+                                         + sigma_sep * VU[t+1, ih2, ik_E, idU_E, ib_sep_E, itype])
                             EV_sick += p * (
                                 (1.0 - pd_out) * VS[t+1, ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype]
-                                + pd_out       * VS[t+1, ih2, ik_E, idU_E, 0, 2, 1, ib_sep_E, itype]
+                                + pd_out       * EV_stay_E
                             )
 
                         # best non-sick option
@@ -814,16 +819,16 @@ def _solve_backward(
                             for ih2 in range(Nh):
                                 EV_nfind += P_h[ih, ih2] * VU[t+1, ih2, ik_U, idU_U, ib, itype]
 
-                            # EV: go sick → VS with medical check at entry.
-                            # With prob (1-p_doc_out): accepted → ir=0 (full benefit).
-                            # With prob p_doc_out:     rejected → ir=2 (b_floor).
+                            # EV: try going sick → medical check fires at transition.
+                            # Accepted (prob 1-p_doc_out): enter S (dS=0, ir=0, io=0).
+                            # Rejected (prob p_doc_out):   stay in U.
                             EV_sick = 0.0
                             for ih2 in range(Nh):
                                 p = P_h[ih, ih2]
                                 pd_out = p_doc_out[ih2]
                                 EV_sick += p * (
                                     (1.0 - pd_out) * VS[t+1, ih2, ik_U, idU_U, 0, 0, 0, ib, itype]
-                                    + pd_out       * VS[t+1, ih2, ik_U, idU_U, 0, 2, 0, ib, itype]
+                                    + pd_out       * VU[t+1, ih2, ik_U, idU_U, ib, itype]
                                 )
 
                             # optimal search effort (closed-form FOC)
@@ -902,10 +907,12 @@ def _forward_distribution(
                             if ph == 0.0:
                                 continue
                             if g_E >= 0.5:
-                                # go sick → S with medical check: accepted (ir=0) or rejected (ir=2)
+                                # try going sick: medical check fires at transition
+                                # accepted → sick leave; rejected → stay in E (exog. sep applies)
                                 pd_out = p_doc_out[ih2]
                                 muS_path[t+1, ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype] += ph * (1.0 - pd_out)
-                                muS_path[t+1, ih2, ik_E, idU_E, 0, 2, 1, ib_sep_E, itype] += ph * pd_out
+                                muE_path[t+1, ih2, ik_E, idU_E, itype]           += ph * pd_out * (1.0 - sigma_sep)
+                                muU_path[t+1, ih2, ik_E, idU_E, ib_sep_E, itype] += ph * pd_out * sigma_sep
                             elif q >= 0.5:
                                 # quit → U
                                 muU_path[t+1, ih2, ik_E, idU_E, ib_sep_E, itype] += ph
@@ -932,10 +939,11 @@ def _forward_distribution(
                                 if ph == 0.0:
                                     continue
                                 if g_U >= 0.5:
-                                    # go sick → S with medical check: accepted (ir=0) or rejected (ir=2)
+                                    # try going sick: medical check fires at transition
+                                    # accepted → sick leave; rejected → stay in U
                                     pd_out = p_doc_out[ih2]
                                     muS_path[t+1, ih2, ik_U, idU_U, 0, 0, 0, ib, itype] += ph * (1.0 - pd_out)
-                                    muS_path[t+1, ih2, ik_U, idU_U, 0, 2, 0, ib, itype] += ph * pd_out
+                                    muU_path[t+1, ih2, ik_U, idU_U, ib, itype]           += ph * pd_out
                                 else:
                                     pf = psi * s
                                     muE_path[t+1, ih2, ik_U, idU_U, itype]     += ph * pf
@@ -950,8 +958,9 @@ def _forward_distribution(
                         for idS in range(NdS):
                             idS_nxt = dS_next_S[idS]
                             for ir in range(Nr):
-                                # ir=1 only valid post-reassessment; ir=2 valid pre (rejected-at-entry)
-                                if idS < t_reassess and ir == 1:
+                                # Only ir=0 valid before reassessment (rejected workers
+                                # never enter sick leave — they stay in E/U).
+                                if idS < t_reassess and ir > 0:
                                     continue
                                 for io in range(No):
                                     for ib in range(Nb):
@@ -1118,8 +1127,8 @@ def _hazard_cohort_s(
                         for idS in range(NdS):
                             idS_nxt = dS_next_S[idS]
                             for ir in range(Nr):
-                                # ir=1 only valid post-reassessment; ir=2 valid pre (rejected-at-entry)
-                                if idS < t_reassess and ir == 1:
+                                # Only ir=0 valid before reassessment.
+                                if idS < t_reassess and ir > 0:
                                     continue
                                 for io in range(No):
                                     for ib in range(Nb):
