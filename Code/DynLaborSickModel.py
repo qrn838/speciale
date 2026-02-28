@@ -99,6 +99,12 @@ class FullLaborModelClass(EconModelClass):
         par.b_wel  = 0.40   # social assistance (dU = 0)
         par.b_emp  = 1.20   # high UI benefit (beskæftigelsestillæg)
         par.bmax   = 1.00   # UI benefit cap
+
+        # ── UI search requirement ─────────────────────────────────────────────
+        # Workers on UI (dU > 0) must search at s ≥ s_bar to receive benefit.
+        # Translates "2 job applications per week" to a minimum effort level.
+        # Workers who find the constraint too costly can escape by going sick.
+        par.s_bar  = 0.10   # minimum search effort to keep UI (calibrate to data)
         par.Nb     = 3      # grid size for pinned UI benefit
 
         # wage base
@@ -264,6 +270,7 @@ class FullLaborModelClass(EconModelClass):
             par.T, par.Nh, par.Nk, par.NdU, par.NdS,
             par.Nr, par.No, par.Nb, par.Ntype,
             par.beta, par.psi, par.sigma_sep, par.t_reassess,
+            par.s_bar,
             par.lambda_grid.astype(np.float64),
             par.nu_grid.astype(np.float64),
             par.h_grid, par.P_h,
@@ -609,6 +616,7 @@ class FullLaborModelClass(EconModelClass):
 def _solve_backward(
     T, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype,
     beta, psi, sigma_sep, t_reassess,
+    s_bar,
     lambda_grid, nu_grid,
     h_grid, P_h,
     log_w, log_b_U, log_b_S,
@@ -789,6 +797,12 @@ def _solve_backward(
                                     s_star = 1.0
                             else:
                                 s_star = 0.0
+
+                            # UI search requirement: workers on UI (dU > 0) must
+                            # search at s ≥ s_bar to receive benefit.
+                            # Welfare recipients (dU = 0) face no requirement.
+                            if idU > 0 and s_star < s_bar:
+                                s_star = s_bar
 
                             pf        = psi * s_star
                             srch_cost = 0.5 * omh * lam * s_star * s_star
