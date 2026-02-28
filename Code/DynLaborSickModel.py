@@ -112,9 +112,10 @@ class FullLaborModelClass(EconModelClass):
         # dS resets to 0 at every new sick spell (no carry-over across U spells).
         par.Sbar        = 24    # max sick duration tracked (capped after this)
         par.t_reassess  = 6    # reassessment at transition dS: t_reassess-1 → t_reassess
-        par.b_sick_high = 1.30 # full sick benefit (pre-reassessment); exceeds b_emp so workers prefer to stay sick until reassessment
+        # Full sick benefit (ir=0) = UI benefit the worker is eligible to (b_grid[ib])
+        # Low  sick benefit (ir=1) = b_sick_low (intermediate scalar)
+        # Floor sick benefit (ir=2) = b_wel (welfare level, as for long-term unemployed)
         par.b_sick_low  = 0.50 # reduced benefit (post-reassessment, low outcome)
-        par.b_floor     = 0.05 # floor if benefit cut to 0 (avoids log(0))
 
         # Benefit-reduction probabilities at reassessment — linear in health:
         #   P(low  | h) = delta0_low + delta1_low*h   [clipped to [0,1]]
@@ -176,13 +177,22 @@ class FullLaborModelClass(EconModelClass):
                     b = par.b_grid[ib]
                 par.log_b_U[dU, ib] = np.log(max(b, 1e-10) * (1.0 - par.tau))
 
-        # log sick benefit by (dS, ir)
-        b_vals = np.array([par.b_sick_high, par.b_sick_low, par.b_floor])
-        par.log_b_S = np.empty((par.NdS, par.Nr))
+        # log sick benefit by (dS, ir, ib):
+        #   ir=0 (full):  b_grid[ib]  — same as the UI benefit the worker is eligible to
+        #   ir=1 (low):   b_sick_low  — intermediate scalar (post-reassessment)
+        #   ir=2 (floor): b_wel       — welfare level (post-reassessment floor)
+        # Pre-reassessment (ids < t_reassess): always use ir=0 level regardless of ir slot.
+        par.log_b_S = np.empty((par.NdS, par.Nr, par.Nb))
         for ids in range(par.NdS):
             for ir in range(par.Nr):
-                b = par.b_sick_high if ids < par.t_reassess else b_vals[ir]
-                par.log_b_S[ids, ir] = np.log(max(b, 1e-10) * (1.0 - par.tau))
+                for ib in range(par.Nb):
+                    if ids < par.t_reassess or ir == 0:
+                        b = par.b_grid[ib]      # full = UI benefit
+                    elif ir == 1:
+                        b = par.b_sick_low      # intermediate
+                    else:                        # ir == 2
+                        b = par.b_wel           # floor = welfare
+                    par.log_b_S[ids, ir, ib] = np.log(max(b, 1e-10) * (1.0 - par.tau))
 
         # log wage by ik
         par.log_w = np.log(
@@ -631,7 +641,7 @@ def _solve_backward(
                                     continue
                                 for io in range(No):
                                     for ib in range(Nb):
-                                        u_S = log_b_S[idS, ir]
+                                        u_S = log_b_S[idS, ir, ib]
 
                                         if last:
                                             VS[t,ih,ik,idU,idS,ir,io,ib,itype] = u_S
