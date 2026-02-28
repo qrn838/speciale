@@ -118,10 +118,20 @@ class FullLaborModelClass(EconModelClass):
         # dS resets to 0 at every new sick spell (no carry-over across U spells).
         par.Sbar        = 24    # max sick duration tracked (capped after this)
         par.t_reassess  = 6    # reassessment at transition dS: t_reassess-1 → t_reassess
-        # Full sick benefit (ir=0) = UI benefit the worker is eligible to (b_grid[ib])
-        # Low  sick benefit (ir=1) = b_sick_low (intermediate scalar)
-        # Floor sick benefit (ir=2) = b_wel (welfare level, as for long-term unemployed)
-        par.b_sick_low  = 0.50 # reduced benefit (post-reassessment, low outcome)
+        # Sick leave benefit structure:
+        #   ir=0 (certified / full):    b_grid[ib]  — same as UI entitlement
+        #   ir=1 (reassess low):        b_sick_low  — only possible at reassessment
+        #   ir=2 (rejected at entry):   b_floor     — medical check failed, ≈ 0
+        #   ir=2 (reassess floor):      b_wel       — welfare, only at reassessment
+        par.b_sick_low  = 0.50  # intermediate benefit at reassessment (ir=1)
+        par.b_floor     = 0.01  # near-zero benefit for rejected-at-entry workers
+
+        # Medical documentation check at spell entry (binary: accept / reject).
+        # Rejected workers (ir=2) get b_floor and immediately prefer to return to UI.
+        # Healthy workers (high h) face a higher rejection probability.
+        par.delta0_doc = -0.20
+        par.delta1_doc =  0.50
+        par.delta2_doc =  0.00
 
         # Benefit-reduction probabilities at reassessment — linear in health:
         #   P(low  | h) = delta0_low + delta1_low*h   [clipped to [0,1]]
@@ -184,21 +194,29 @@ class FullLaborModelClass(EconModelClass):
                 par.log_b_U[dU, ib] = np.log(max(b, 1e-10) * (1.0 - par.tau))
 
         # log sick benefit by (dS, ir, ib):
-        #   ir=0 (full):  b_grid[ib]  — same as the UI benefit the worker is eligible to
-        #   ir=1 (low):   b_sick_low  — intermediate scalar (post-reassessment)
-        #   ir=2 (floor): b_wel       — welfare level (post-reassessment floor)
-        # Pre-reassessment (ids < t_reassess): always use ir=0 level regardless of ir slot.
+        #   ir=0:  b_grid[ib]  — always full = UI benefit (certified or reassess-high)
+        #   ir=1:  b_sick_low  — only at reassessment (dS >= t_reassess); pre-reassess unused
+        #   ir=2:  b_floor     — rejected at entry (dS < t_reassess, near-zero)
+        #          b_wel       — welfare floor at reassessment (dS >= t_reassess)
         par.log_b_S = np.empty((par.NdS, par.Nr, par.Nb))
         for ids in range(par.NdS):
             for ir in range(par.Nr):
                 for ib in range(par.Nb):
-                    if ids < par.t_reassess or ir == 0:
-                        b = par.b_grid[ib]      # full = UI benefit
+                    if ir == 0:
+                        b = par.b_grid[ib]
                     elif ir == 1:
-                        b = par.b_sick_low      # intermediate
-                    else:                        # ir == 2
-                        b = par.b_wel           # floor = welfare
+                        b = par.b_sick_low          # only meaningful post-reassessment
+                    else:                            # ir == 2
+                        b = par.b_wel if ids >= par.t_reassess else par.b_floor
                     par.log_b_S[ids, ir, ib] = np.log(max(b, 1e-10) * (1.0 - par.tau))
+
+        # ── medical documentation check probabilities ─────────────────────────
+        # p_doc_out[ih]: probability of being rejected (ir=2, b_floor) at entry.
+        par.p_doc_out = np.empty(par.Nh)
+        for ih in range(par.Nh):
+            h  = par.h_grid[ih]
+            po = par.delta0_doc + par.delta1_doc * h + par.delta2_doc * h**2
+            par.p_doc_out[ih] = float(np.clip(po, 0.0, 1.0))
 
         # log wage by ik
         par.log_w = np.log(
@@ -279,7 +297,7 @@ class FullLaborModelClass(EconModelClass):
             par.dU_next_U, par.dU_next_E,
             par.dS_next_S,
             par.ib_sep_by_ik,
-            par.p_low, par.p_out,
+            par.p_low, par.p_out, par.p_doc_out,
             sol.VE, sol.VU, sol.VS,
             sol.s, sol.g_U, sol.q, sol.g_E, sol.ret,
         )
@@ -307,7 +325,7 @@ class FullLaborModelClass(EconModelClass):
             par.dU_next_U, par.dU_next_E,
             par.dS_next_S,
             par.ib_sep_by_ik,
-            par.p_low, par.p_out,
+            par.p_low, par.p_out, par.p_doc_out,
             sol.s, sol.g_U, sol.q, sol.g_E, sol.ret,
             muE0, muU0, muS0,
             sim.muE, sim.muU, sim.muS,
@@ -481,8 +499,10 @@ class FullLaborModelClass(EconModelClass):
                             continue
                         if sol.g_E[t0, ih, ik, idU, itype] >= 0.5:
                             for ih2 in range(par.Nh):
-                                cohort0[ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype] += (
-                                    par.P_h[ih, ih2] * m)
+                                pd_out = par.p_doc_out[ih2]
+                                ph = par.P_h[ih, ih2] * m
+                                cohort0[ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype] += ph * (1.0 - pd_out)
+                                cohort0[ih2, ik_E, idU_E, 0, 2, 1, ib_sep_E, itype] += ph * pd_out
 
         # from U (g_U=1): enter S with dS=0, ir=0, io=0, ib=current ib
         muU_t0 = sim.muU[t0]
@@ -498,8 +518,10 @@ class FullLaborModelClass(EconModelClass):
                                 continue
                             if sol.g_U[t0, ih, ik, idU, ib, itype] >= 0.5:
                                 for ih2 in range(par.Nh):
-                                    cohort0[ih2, ik_U, idU_U, 0, 0, 0, ib, itype] += (
-                                        par.P_h[ih, ih2] * m)
+                                    pd_out = par.p_doc_out[ih2]
+                                    ph = par.P_h[ih, ih2] * m
+                                    cohort0[ih2, ik_U, idU_U, 0, 0, 0, ib, itype] += ph * (1.0 - pd_out)
+                                    cohort0[ih2, ik_U, idU_U, 0, 2, 0, ib, itype] += ph * pd_out
         return cohort0
 
     # ── hazard: U → S ────────────────────────────────────────────────────────
@@ -624,7 +646,7 @@ def _solve_backward(
     dU_next_U, dU_next_E,
     dS_next_S,
     ib_sep_by_ik,
-    p_low, p_out,
+    p_low, p_out, p_doc_out,
     VE, VU, VS,
     s_pol, g_U_pol, q_pol, g_E_pol, ret_pol,
 ):
@@ -644,8 +666,9 @@ def _solve_backward(
                         for idS in range(NdS):
                             idS_nxt = dS_next_S[idS]
                             for ir in range(Nr):
-                                # pre-reassessment states only exist at ir=0
-                                if idS < t_reassess and ir > 0:
+                                # ir=1 (reassess-low) only exists after reassessment;
+                                # ir=0 and ir=2 (rejected-at-entry) are valid pre-reassessment.
+                                if idS < t_reassess and ir == 1:
                                     continue
                                 for io in range(No):
                                     for ib in range(Nb):
@@ -730,10 +753,17 @@ def _solve_backward(
                                 + sigma_sep        * VU[t+1, ih2, ik_E, idU_E, ib_sep_E, itype]
                             )
 
-                        # EV: go sick → VS  (new spell: dS=0, ir=0, io=1)
+                        # EV: go sick → VS with medical check at entry.
+                        # With prob (1-p_doc_out): accepted → ir=0 (full benefit).
+                        # With prob p_doc_out:     rejected → ir=2 (b_floor).
                         EV_sick = 0.0
                         for ih2 in range(Nh):
-                            EV_sick += P_h[ih, ih2] * VS[t+1, ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype]
+                            p = P_h[ih, ih2]
+                            pd_out = p_doc_out[ih2]
+                            EV_sick += p * (
+                                (1.0 - pd_out) * VS[t+1, ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype]
+                                + pd_out       * VS[t+1, ih2, ik_E, idU_E, 0, 2, 1, ib_sep_E, itype]
+                            )
 
                         # best non-sick option
                         if EV_quit >= EV_stay:
@@ -784,10 +814,17 @@ def _solve_backward(
                             for ih2 in range(Nh):
                                 EV_nfind += P_h[ih, ih2] * VU[t+1, ih2, ik_U, idU_U, ib, itype]
 
-                            # EV: go sick → VS  (new spell: dS=0, ir=0, io=0)
+                            # EV: go sick → VS with medical check at entry.
+                            # With prob (1-p_doc_out): accepted → ir=0 (full benefit).
+                            # With prob p_doc_out:     rejected → ir=2 (b_floor).
                             EV_sick = 0.0
                             for ih2 in range(Nh):
-                                EV_sick += P_h[ih, ih2] * VS[t+1, ih2, ik_U, idU_U, 0, 0, 0, ib, itype]
+                                p = P_h[ih, ih2]
+                                pd_out = p_doc_out[ih2]
+                                EV_sick += p * (
+                                    (1.0 - pd_out) * VS[t+1, ih2, ik_U, idU_U, 0, 0, 0, ib, itype]
+                                    + pd_out       * VS[t+1, ih2, ik_U, idU_U, 0, 2, 0, ib, itype]
+                                )
 
                             # optimal search effort (closed-form FOC)
                             dV = EV_find - EV_nfind
@@ -832,7 +869,7 @@ def _forward_distribution(
     dU_next_U, dU_next_E,
     dS_next_S,
     ib_sep_by_ik,
-    p_low, p_out,
+    p_low, p_out, p_doc_out,
     s_pol, g_U_pol, q_pol, g_E_pol, ret_pol,
     muE0, muU0, muS0,
     muE_path, muU_path, muS_path,
@@ -865,8 +902,10 @@ def _forward_distribution(
                             if ph == 0.0:
                                 continue
                             if g_E >= 0.5:
-                                # go sick → S (dS=0, ir=0, io=1)
-                                muS_path[t+1, ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype] += ph
+                                # go sick → S with medical check: accepted (ir=0) or rejected (ir=2)
+                                pd_out = p_doc_out[ih2]
+                                muS_path[t+1, ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype] += ph * (1.0 - pd_out)
+                                muS_path[t+1, ih2, ik_E, idU_E, 0, 2, 1, ib_sep_E, itype] += ph * pd_out
                             elif q >= 0.5:
                                 # quit → U
                                 muU_path[t+1, ih2, ik_E, idU_E, ib_sep_E, itype] += ph
@@ -893,8 +932,10 @@ def _forward_distribution(
                                 if ph == 0.0:
                                     continue
                                 if g_U >= 0.5:
-                                    # go sick → S (dS=0, ir=0, io=0)
-                                    muS_path[t+1, ih2, ik_U, idU_U, 0, 0, 0, ib, itype] += ph
+                                    # go sick → S with medical check: accepted (ir=0) or rejected (ir=2)
+                                    pd_out = p_doc_out[ih2]
+                                    muS_path[t+1, ih2, ik_U, idU_U, 0, 0, 0, ib, itype] += ph * (1.0 - pd_out)
+                                    muS_path[t+1, ih2, ik_U, idU_U, 0, 2, 0, ib, itype] += ph * pd_out
                                 else:
                                     pf = psi * s
                                     muE_path[t+1, ih2, ik_U, idU_U, itype]     += ph * pf
@@ -909,7 +950,8 @@ def _forward_distribution(
                         for idS in range(NdS):
                             idS_nxt = dS_next_S[idS]
                             for ir in range(Nr):
-                                if idS < t_reassess and ir > 0:
+                                # ir=1 only valid post-reassessment; ir=2 valid pre (rejected-at-entry)
+                                if idS < t_reassess and ir == 1:
                                     continue
                                 for io in range(No):
                                     for ib in range(Nb):
@@ -1076,7 +1118,8 @@ def _hazard_cohort_s(
                         for idS in range(NdS):
                             idS_nxt = dS_next_S[idS]
                             for ir in range(Nr):
-                                if idS < t_reassess and ir > 0:
+                                # ir=1 only valid post-reassessment; ir=2 valid pre (rejected-at-entry)
+                                if idS < t_reassess and ir == 1:
                                     continue
                                 for io in range(No):
                                     for ib in range(Nb):
