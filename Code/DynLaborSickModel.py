@@ -3,7 +3,7 @@ from scipy.stats import norm as scipy_norm
 from EconModel import EconModelClass
 from consav.grids import nonlinspace
 import pandas as pd
-from numba import njit
+from numba import njit, prange
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tauchen discretization of the logit-AR(1) health process
@@ -73,7 +73,7 @@ class FullLaborModelClass(EconModelClass):
         # ── health AR(1) (logit scale) ──────────────────────────────────────
         par.rho_h   = 0.915   # persistence
         par.sigma_h = 0.30    # innovation std on logit scale
-        par.Nh      = 5       # health grid points
+        par.Nh      = 10       # health grid points
 
         # ── human capital ───────────────────────────────────────────────────
         par.alpha   = 0.10    # wage return: w_t = w*(1 + alpha*k_t)
@@ -90,6 +90,12 @@ class FullLaborModelClass(EconModelClass):
         par.nu_grid      = np.array([2.0, 5.0])  # work disutility scale by type
         #   search disutility (unemployed):  -(1-h)*lambda_n * s^2/2
         #   work  disutility (employed):     -nu_n * (1-h)^2/2
+
+        # Initial health distribution: stationary distribution of the health AR(1),
+        # shifted in logit z-space per type.  z=0 maps to h=0.5; negative z → lower h.
+        # Type 0 (low cost):  centred at h≈0.5
+        # Type 1 (high cost): shifted left → lower initial health mean
+        par.h_init_mu = np.array([0.0, -0.5])
 
         # ── UI system ────────────────────────────────────────────────────────
         par.Ubar = 24    # max UI entitlement (periods)
@@ -117,7 +123,7 @@ class FullLaborModelClass(EconModelClass):
         # ── sickness leave ───────────────────────────────────────────────────
         # dS resets to 0 at every new sick spell (no carry-over across U spells).
         par.Sbar        = 24    # max sick duration tracked (capped after this)
-        par.t_reassess  = 6    # reassessment at transition dS: t_reassess-1 → t_reassess
+        par.t_reassess  = 6     # reassessment at transition dS: t_reassess-1 → t_reassess
         # Sick leave benefit structure:
         #   ir=0 (certified / full):    b_grid[ib]  — same as UI entitlement
         #   ir=1 (reassess low):        b_sick_low  — only possible at reassessment
@@ -133,7 +139,7 @@ class FullLaborModelClass(EconModelClass):
         # rejection risk — otherwise it has no effect on the gaming workers
         # (who are low-health and have the highest search-cost burden from s_bar).
         par.delta0_doc =  0.15
-        par.delta1_doc =  0.50
+        par.delta1_doc =  0.9
         par.delta2_doc =  0.00
 
         # Benefit-reduction probabilities at reassessment — linear in health:
@@ -160,6 +166,30 @@ class FullLaborModelClass(EconModelClass):
 
         # ── health ──────────────────────────────────────────────────────────
         par.h_grid, par.P_h = discretize_health_ar1(par.Nh, par.rho_h, par.sigma_h)
+
+        # ── type-specific initial health distributions ────────────────────────
+        # Stationary distribution of the health AR(1) is N(0, sigma_z^2) in logit
+        # z-space.  Shift the mean by h_init_mu[itype] to give each type a
+        # different initial health level, then discretise onto h_grid.
+        sig_z  = par.sigma_h / np.sqrt(max(1.0 - par.rho_h**2, 1e-12))
+        n_std  = 3.0
+        z_grid = np.linspace(-n_std * sig_z, n_std * sig_z, par.Nh)
+        step   = z_grid[1] - z_grid[0]
+
+        par.h_init_dist = np.zeros((par.Ntype, par.Nh))
+        for itype in range(par.Ntype):
+            mu_z = par.h_init_mu[itype]
+            for ih in range(par.Nh):
+                lo = z_grid[ih] - 0.5 * step
+                hi = z_grid[ih] + 0.5 * step
+                if ih == 0:
+                    par.h_init_dist[itype, ih] = scipy_norm.cdf(hi, mu_z, sig_z)
+                elif ih == par.Nh - 1:
+                    par.h_init_dist[itype, ih] = 1.0 - scipy_norm.cdf(lo, mu_z, sig_z)
+                else:
+                    par.h_init_dist[itype, ih] = (scipy_norm.cdf(hi, mu_z, sig_z)
+                                                   - scipy_norm.cdf(lo, mu_z, sig_z))
+            par.h_init_dist[itype] /= par.h_init_dist[itype].sum()
 
         # ── k grid ──────────────────────────────────────────────────────────
         par.k_grid = nonlinspace(0.0, par.k_max, par.Nk, 1.1)
@@ -220,6 +250,10 @@ class FullLaborModelClass(EconModelClass):
             h  = par.h_grid[ih]
             po = par.delta0_doc + par.delta1_doc * h + par.delta2_doc * h**2
             par.p_doc_out[ih] = float(np.clip(po, 0.0, 1.0))
+
+        # E[p_doc_out(h') | h]: expected rejection probability at next-period health.
+        # Used for the 1-period zero-benefit penalty for rejected U→S attempts.
+        par.E_p_doc_out = par.P_h @ par.p_doc_out
 
         # log wage by ik
         par.log_w = np.log(
@@ -287,37 +321,97 @@ class FullLaborModelClass(EconModelClass):
     # ── solve ────────────────────────────────────────────────────────────────
     def solve(self):
         par, sol = self.par, self.sol
-        _solve_backward(
-            par.T, par.Nh, par.Nk, par.NdU, par.NdS,
-            par.Nr, par.No, par.Nb, par.Ntype,
-            par.beta, par.psi, par.sigma_sep, par.t_reassess,
-            par.s_bar,
-            par.lambda_grid.astype(np.float64),
-            par.nu_grid.astype(np.float64),
-            par.h_grid, par.P_h,
-            par.log_w, par.log_b_U, par.log_b_S,
-            par.ik_next_U, par.ik_next_EH,
-            par.dU_next_U, par.dU_next_E,
-            par.dS_next_S,
-            par.ib_sep_by_ik,
-            par.p_low, par.p_out, par.p_doc_out,
-            sol.VE, sol.VU, sol.VS,
-            sol.s, sol.g_U, sol.q, sol.g_E, sol.ret,
-        )
+        Ph         = par.P_h                              # (Nh, Nh)
+        p_hi       = 1.0 - par.p_low - par.p_out         # (Nh,)
+        ids_nxt_ra = int(par.dS_next_S[par.t_reassess - 1])
+
+        # Dummy EV arrays for the terminal period (never accessed when last=True)
+        _z4   = np.zeros((par.Nh, par.Nk, par.NdU, par.Ntype))
+        _z5   = np.zeros((par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype))
+        _z8   = np.zeros((par.Nh, par.Nk, par.NdU, par.NdS,
+                          par.Nr, par.No, par.Nb, par.Ntype))
+        _z_ra = np.zeros((par.Nh, par.Nk, par.NdU, par.No, par.Nb, par.Ntype))
+
+        lam_f64 = par.lambda_grid.astype(np.float64)
+        nu_f64  = par.nu_grid.astype(np.float64)
+
+        for t in range(par.T - 1, -1, -1):
+            last = (t == par.T - 1)
+
+            if not last:
+                VEt1 = sol.VE[t+1]   # (Nh, Nk, NdU, Ntype)
+                VUt1 = sol.VU[t+1]   # (Nh, Nk, NdU, Nb, Ntype)
+                VSt1 = sol.VS[t+1]   # (Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype)
+
+                # Standard expectations: Ph @ V[t+1] along the ih axis
+                EV_E = (Ph @ VEt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Ntype)
+                EV_U = (Ph @ VUt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
+                EV_S = (Ph @ VSt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.NdS, par.Nr, par.No, par.Nb, par.Ntype)
+
+                # Weighted VS at reassessment: p_high*VS_r0 + p_low*VS_r1 + p_out*VS_r2
+                W_ra = (p_hi[:, None, None, None, None, None]      * VSt1[:, :, :, ids_nxt_ra, 0, :, :, :]
+                        + par.p_low[:, None, None, None, None, None] * VSt1[:, :, :, ids_nxt_ra, 1, :, :, :]
+                        + par.p_out[:, None, None, None, None, None] * VSt1[:, :, :, ids_nxt_ra, 2, :, :, :])
+                EV_S_ra = (Ph @ W_ra.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.No, par.Nb, par.Ntype)
+
+                # Medical-check accepted: (1-p_doc_out)*VS at dS=0, ir=0
+                W_enter_E = ((1.0 - par.p_doc_out)[:, None, None, None, None]
+                             * VSt1[:, :, :, 0, 0, 1, :, :])
+                EV_S_enter_E = (Ph @ W_enter_E.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
+
+                W_enter_U = ((1.0 - par.p_doc_out)[:, None, None, None, None]
+                             * VSt1[:, :, :, 0, 0, 0, :, :])
+                EV_S_enter_U = (Ph @ W_enter_U.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
+
+                # Medical-check rejected: p_doc_out*VE and p_doc_out*VU
+                W_doc_E = par.p_doc_out[:, None, None, None] * VEt1
+                EV_doc_E = (Ph @ W_doc_E.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Ntype)
+
+                W_doc_U = par.p_doc_out[:, None, None, None, None] * VUt1
+                EV_doc_U = (Ph @ W_doc_U.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
+
+            else:
+                EV_E, EV_U, EV_S, EV_S_ra = _z4, _z5, _z8, _z_ra
+                EV_S_enter_E = EV_S_enter_U = _z5
+                EV_doc_E = _z4
+                EV_doc_U = _z5
+
+            _solve_t(
+                t, last,
+                par.Nh, par.Nk, par.NdU, par.NdS,
+                par.Nr, par.No, par.Nb, par.Ntype,
+                par.beta, par.psi, par.sigma_sep, par.t_reassess,
+                par.s_bar,
+                lam_f64, nu_f64,
+                par.h_grid,
+                par.log_w, par.log_b_U, par.log_b_S,
+                par.ik_next_U, par.ik_next_EH,
+                par.dU_next_U, par.dU_next_E,
+                par.dS_next_S,
+                par.ib_sep_by_ik,
+                EV_E, EV_U, EV_S, EV_S_ra,
+                EV_S_enter_E, EV_S_enter_U, EV_doc_E, EV_doc_U,
+                par.E_p_doc_out,
+                np.float64(np.log(par.b_floor * (1.0 - par.tau))),
+                sol.VE, sol.VU, sol.VS,
+                sol.s, sol.g_U, sol.q, sol.g_E, sol.ret,
+            )
 
     # ── forward distribution ─────────────────────────────────────────────────
     def simulate(self):
         par, sol, sim = self.par, self.sol, self.sim
 
-        # initial distribution: split across types, employed at median health,
-        # lowest k, full UI entitlement
+        # initial distribution: each type distributed over health grid according
+        # to their type-specific stationary distribution (h_init_dist), all at
+        # lowest k and full UI entitlement, all employed.
         muE0 = np.zeros((par.Nh, par.Nk, par.NdU, par.Ntype))
         muU0 = np.zeros((par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype))
         muS0 = np.zeros((par.Nh, par.Nk, par.NdU, par.NdS, par.Nr, par.No, par.Nb, par.Ntype))
 
-        ih0, ik0, idU0 = par.Nh // 2, 0, par.Ubar
+        ik0, idU0 = 0, par.Ubar
         for itype in range(par.Ntype):
-            muE0[ih0, ik0, idU0, itype] = par.type_shares[itype]
+            for ih in range(par.Nh):
+                muE0[ih, ik0, idU0, itype] = par.type_shares[itype] * par.h_init_dist[itype, ih]
 
         _forward_distribution(
             par.T, par.Nh, par.Nk, par.NdU, par.NdS,
@@ -353,69 +447,26 @@ class FullLaborModelClass(EconModelClass):
             max_d = min(par.T - 1 - t0, par.Ubar + 2)
         max_d = int(max_d)
 
-        # cohort that enters U between t0 and t0+1 (from E or S separations)
-        cohort0 = np.zeros((par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype))
-
-        # inflows from E (quit + sigma separation)
-        muE_t0 = sim.muE[t0]
-        for ih in range(par.Nh):
-            for ik in range(par.Nk):
-                ik_E     = par.ik_next_EH[ik, ih]
-                ib_sep_E = par.ib_sep_by_ik[ik_E]
-                for idU in range(par.NdU):
-                    idU_E = par.dU_next_E[idU]
-                    for itype in range(par.Ntype):
-                        m = muE_t0[ih, ik, idU, itype]
-                        if m == 0.0:
-                            continue
-                        g_E = sol.g_E[t0, ih, ik, idU, itype]
-                        q   = sol.q[t0, ih, ik, idU, itype]
-                        if g_E < 0.5:
-                            if q >= 0.5:
-                                p_to_u = 1.0
-                            else:
-                                p_to_u = par.sigma_sep
-                            for ih2 in range(par.Nh):
-                                cohort0[ih2, ik_E, idU_E, ib_sep_E, itype] += (
-                                    par.P_h[ih, ih2] * m * p_to_u)
-
-        # inflows from S with origin=1 (separation on return)
-        muS_t0 = sim.muS[t0]
-        for ih in range(par.Nh):
-            for ik in range(par.Nk):
-                ik_S     = par.ik_next_U[ik]
-                ib_sep_S = par.ib_sep_by_ik[ik_S]
-                for idU in range(par.NdU):
-                    for ids in range(par.NdS):
-                        for ir in range(par.Nr):
-                            for ib in range(par.Nb):
-                                m = muS_t0[ih, ik, idU, ids, ir, 1, ib, :].sum()
-                                if m == 0.0:
-                                    continue
-                                r = sol.ret[t0, ih, ik, idU, ids, ir, 1, ib, 0]
-                                if r >= 0.5:
-                                    for ih2 in range(par.Nh):
-                                        cohort0[ih2, ik_S, idU, ib_sep_S, 0] += (
-                                            par.P_h[ih, ih2] * m * par.sigma_sep)
-
-        # propagate cohort forward (pure U dynamics)
-        s_slice = sol.s[t0:t0 + max_d]  # (max_d, Nh, Nk, NdU, Nb, Ntype)
-        hazard_out  = np.empty(max_d)
+        cohort0     = self._build_u_entry_cohort(t0)
         at_risk_out = np.empty(max_d)
-        exits_out   = np.empty(max_d)
+        exits_E_out = np.empty(max_d)
+        exits_S_out = np.empty(max_d)
 
-        _hazard_cohort(
+        _hazard_cohort_u(
             max_d, par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype,
             par.psi, par.P_h,
             par.ik_next_U, par.dU_next_U,
-            s_slice, cohort0,
-            hazard_out, at_risk_out, exits_out,
+            sol.s[t0:t0 + max_d],
+            sol.g_U[t0:t0 + max_d],
+            cohort0,
+            at_risk_out, exits_E_out, exits_S_out,
         )
+        hazard = np.where(at_risk_out > 0, exits_E_out / at_risk_out, 0.0)
         return pd.DataFrame({
             "duration": np.arange(1, max_d + 1),
             "at_risk":  at_risk_out,
-            "exits":    exits_out,
-            "hazard":   hazard_out,
+            "exits":    exits_E_out,
+            "hazard":   hazard,
         })
 
     # ── cohort builders (shared by multiple hazard methods) ───────────────────
@@ -630,242 +681,217 @@ class FullLaborModelClass(EconModelClass):
             "hazard":   hazard,
         })
 
+    # ── hazard: S pooled (all spells, all calendar times) ────────────────────
+
+    def hazard_s_pooled(self, max_d=None):
+        """
+        Sick-leave hazard rates pooled across all calendar times and spell origins.
+
+        At each duration d (= idS + 1), aggregates all mass currently at that
+        sick-leave duration across every period t, then computes:
+            hazard_E(d) = exits to E / at_risk
+            hazard_U(d) = exits to U / at_risk
+
+        This matches how empirical hazard rates are estimated from administrative
+        data: every ongoing spell contributes to the at-risk count at its current
+        duration, regardless of when the spell started.
+        """
+        par, sol, sim = self.par, self.sol, self.sim
+
+        if max_d is None:
+            max_d = par.NdS
+        max_d = int(max_d)
+
+        # Single-pass parallel Numba kernel — avoids large numpy temporaries.
+        # Exclude last period (terminal ret=0 everywhere, no forward decision).
+        muS = sim.muS[:-1, :, :, :, :max_d, :, :, :, :]
+        ret = sol.ret[:-1, :, :, :, :max_d, :, :, :, :]
+
+        at_risk, exits_E, exits_U, hazard_E, hazard_U = _pooled_hazard_kernel(
+            muS, ret, max_d, par.sigma_sep
+        )
+
+        return pd.DataFrame({
+            "duration": np.arange(1, max_d + 1),
+            "at_risk":  at_risk,
+            "exits_E":  exits_E,
+            "exits_U":  exits_U,
+            "hazard_E": hazard_E,
+            "hazard_U": hazard_U,
+        })
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Numba: backward induction
+# Numba: backward induction (single period)
+# EVs are pre-computed in Python via numpy BLAS before calling this.
 # ─────────────────────────────────────────────────────────────────────────────
 
-@njit
-def _solve_backward(
-    T, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype,
-    beta, psi, sigma_sep, t_reassess,
-    s_bar,
+@njit(parallel=True, cache=True, fastmath=True)
+def _solve_t(
+    t, last,
+    Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype,
+    beta, psi, sigma_sep, t_reassess, s_bar,
     lambda_grid, nu_grid,
-    h_grid, P_h,
+    h_grid,
     log_w, log_b_U, log_b_S,
     ik_next_U, ik_next_EH,
     dU_next_U, dU_next_E,
     dS_next_S,
     ib_sep_by_ik,
-    p_low, p_out, p_doc_out,
+    EV_E, EV_U, EV_S, EV_S_ra,
+    EV_S_enter_E, EV_S_enter_U, EV_doc_E, EV_doc_U,
+    E_p_doc_out, log_b_floor_val,
     VE, VU, VS,
     s_pol, g_U_pol, q_pol, g_E_pol, ret_pol,
 ):
-    for t in range(T - 1, -1, -1):
-        last = (t == T - 1)
-
-        # ──────────────────────── V^S ────────────────────────────────────────
-        # Solved first so VE/VU can reference VS[t] when computing go-sick EV.
-        # (They reference VS[t+1], so order within t is irrelevant —
-        #  keeping VS first is just for clarity.)
-        for itype in range(Ntype):
-            for ih in range(Nh):
-                for ik in range(Nk):
-                    ik_S = ik_next_U[ik]   # k decays while sick (Eq. 11)
-                    for idU in range(NdU):
-                        # dU frozen during sick leave (Eq. 12 top branch)
-                        for idS in range(NdS):
-                            idS_nxt = dS_next_S[idS]
-                            for ir in range(Nr):
-                                # Only ir=0 exists before reassessment.
-                                # ir=1 (low) and ir=2 (welfare) arise only at reassessment.
-                                # Rejected-at-entry workers never enter sick leave — they
-                                # stay in their prior state (E or U).
-                                if idS < t_reassess and ir > 0:
-                                    continue
-                                for io in range(No):
-                                    for ib in range(Nb):
-                                        u_S = log_b_S[idS, ir, ib]
-
-                                        if last:
-                                            VS[t,ih,ik,idU,idS,ir,io,ib,itype] = u_S
-                                            ret_pol[t,ih,ik,idU,idS,ir,io,ib,itype] = 0.0
-                                            continue
-
-                                        # ── Option A: return from sick leave ──
-                                        EV_ret = 0.0
-                                        if io == 1:  # origin = employment
-                                            ib_sep_S = ib_sep_by_ik[ik_S]
-                                            for ih2 in range(Nh):
-                                                p = P_h[ih, ih2]
-                                                EV_ret += p * (
-                                                    (1.0 - sigma_sep) * VE[t+1, ih2, ik_S, idU, itype]
-                                                    + sigma_sep * VU[t+1, ih2, ik_S, idU, ib_sep_S, itype]
-                                                )
-                                        else:  # origin = unemployment
-                                            for ih2 in range(Nh):
-                                                EV_ret += P_h[ih, ih2] * VU[t+1, ih2, ik_S, idU, ib, itype]
-
-                                        # ── Option B: stay on sick leave ──────
-                                        # Reassessment fires when dS transitions
-                                        # from t_reassess-1 to t_reassess (once per spell).
-                                        at_reassess = (idS == t_reassess - 1) and (ir == 0)
-                                        EV_stay = 0.0
-                                        for ih2 in range(Nh):
-                                            p = P_h[ih, ih2]
-                                            if at_reassess:
-                                                pl = p_low[ih2]
-                                                po = p_out[ih2]
-                                                ph = 1.0 - pl - po
-                                                EV_stay += p * (
-                                                    ph * VS[t+1, ih2, ik_S, idU, idS_nxt, 0, io, ib, itype]
-                                                    + pl * VS[t+1, ih2, ik_S, idU, idS_nxt, 1, io, ib, itype]
-                                                    + po * VS[t+1, ih2, ik_S, idU, idS_nxt, 2, io, ib, itype]
-                                                )
-                                            else:
-                                                EV_stay += p * VS[t+1, ih2, ik_S, idU, idS_nxt, ir, io, ib, itype]
-
-                                        if EV_ret >= EV_stay:
-                                            VS[t,ih,ik,idU,idS,ir,io,ib,itype] = u_S + beta * EV_ret
-                                            ret_pol[t,ih,ik,idU,idS,ir,io,ib,itype] = 1.0
-                                        else:
-                                            VS[t,ih,ik,idU,idS,ir,io,ib,itype] = u_S + beta * EV_stay
-                                            ret_pol[t,ih,ik,idU,idS,ir,io,ib,itype] = 0.0
-
-        # ──────────────────────── V^E ────────────────────────────────────────
-        # Choices: go sick (g=1)  |  quit (q=1)  |  stay (q=0, exog. sep σ)
-        # Work disutility: -nu_n * (1-h)^2 / 2  [ι=1 in Eq. 17]
-        for itype in range(Ntype):
-            nu = nu_grid[itype]
-            for ih in range(Nh):
-                h        = h_grid[ih]
-                dis_work = -nu * (1.0 - h) ** 2 / 2.0
-                for ik in range(Nk):
-                    ik_E     = ik_next_EH[ik, ih]   # k' = (1-δ)*k + h  (Eq. 11)
-                    ib_sep_E = ib_sep_by_ik[ik_E]
-                    u_E      = log_w[ik] + dis_work
-                    for idU in range(NdU):
-                        idU_E = dU_next_E[idU]
-
-                        if last:
-                            VE[t,ih,ik,idU,itype]   = u_E
-                            q_pol[t,ih,ik,idU,itype]   = 0.0
-                            g_E_pol[t,ih,ik,idU,itype] = 0.0
-                            continue
-
-                        # EV: quit → U
-                        EV_quit = 0.0
-                        for ih2 in range(Nh):
-                            EV_quit += P_h[ih, ih2] * VU[t+1, ih2, ik_E, idU_E, ib_sep_E, itype]
-
-                        # EV: stay E (exogenous separation σ)
-                        EV_stay = 0.0
-                        for ih2 in range(Nh):
-                            EV_stay += P_h[ih, ih2] * (
-                                (1.0 - sigma_sep) * VE[t+1, ih2, ik_E, idU_E, itype]
-                                + sigma_sep        * VU[t+1, ih2, ik_E, idU_E, ib_sep_E, itype]
-                            )
-
-                        # EV: try going sick → medical check fires at transition.
-                        # Accepted (prob 1-p_doc_out): enter S (dS=0, ir=0, io=1).
-                        # Rejected (prob p_doc_out):   stay in E (exog. sep still applies).
-                        EV_sick = 0.0
-                        for ih2 in range(Nh):
-                            p = P_h[ih, ih2]
-                            pd_out = p_doc_out[ih2]
-                            EV_stay_E = ((1.0 - sigma_sep) * VE[t+1, ih2, ik_E, idU_E, itype]
-                                         + sigma_sep * VU[t+1, ih2, ik_E, idU_E, ib_sep_E, itype])
-                            EV_sick += p * (
-                                (1.0 - pd_out) * VS[t+1, ih2, ik_E, idU_E, 0, 0, 1, ib_sep_E, itype]
-                                + pd_out       * EV_stay_E
-                            )
-
-                        # best non-sick option
-                        if EV_quit >= EV_stay:
-                            best_ns = EV_quit
-                            q_best  = 1.0
-                        else:
-                            best_ns = EV_stay
-                            q_best  = 0.0
-
-                        if EV_sick >= best_ns:
-                            VE[t,ih,ik,idU,itype]      = u_E + beta * EV_sick
-                            g_E_pol[t,ih,ik,idU,itype] = 1.0
-                            q_pol[t,ih,ik,idU,itype]   = 0.0
-                        else:
-                            VE[t,ih,ik,idU,itype]      = u_E + beta * best_ns
-                            g_E_pol[t,ih,ik,idU,itype] = 0.0
-                            q_pol[t,ih,ik,idU,itype]   = q_best
-
-        # ──────────────────────── V^U ────────────────────────────────────────
-        # Choices: go sick (g=1)  |  search with effort s ∈ [0,1]
-        # Search disutility: -(1-h)*lambda_n * s^2/2  (quadratic, γ=1 in Eq. 15)
-        # FOC → s* = β*psi*(VE-VU) / ((1-h)*lambda_n),  clipped to [0,1]
-        for itype in range(Ntype):
-            lam = lambda_grid[itype]
-            for ih in range(Nh):
-                h   = h_grid[ih]
-                omh = max(1.0 - h, 1e-8)  # (1-h), floored to avoid /0
-                for ik in range(Nk):
-                    ik_U = ik_next_U[ik]
-                    for idU in range(NdU):
-                        idU_U = dU_next_U[idU]
+    # ──────────────────────── V^S ────────────────────────────────────────
+    for idx_S in prange(Ntype * Nh * Nk):
+        itype    = idx_S // (Nh * Nk)
+        ih       = (idx_S % (Nh * Nk)) // Nk
+        ik       = idx_S % Nk
+        ik_S     = ik_next_U[ik]
+        ib_sep_S = ib_sep_by_ik[ik_S]
+        for idU in range(NdU):
+            for idS in range(NdS):
+                idS_nxt = dS_next_S[idS]
+                for ir in range(Nr):
+                    if idS < t_reassess and ir > 0:
+                        continue
+                    for io in range(No):
                         for ib in range(Nb):
-                            u_U = log_b_U[idU, ib]
+                            u_S = log_b_S[idS, ir, ib]
 
                             if last:
-                                VU[t,ih,ik,idU,ib,itype]   = u_U
-                                s_pol[t,ih,ik,idU,ib,itype]   = 0.0
-                                g_U_pol[t,ih,ik,idU,ib,itype] = 0.0
+                                VS[t,ih,ik,idU,idS,ir,io,ib,itype]      = u_S
+                                ret_pol[t,ih,ik,idU,idS,ir,io,ib,itype] = 0.0
                                 continue
 
-                            # EV: find job → E
-                            EV_find = 0.0
-                            for ih2 in range(Nh):
-                                EV_find += P_h[ih, ih2] * VE[t+1, ih2, ik_U, idU_U, itype]
+                            # ── Option A: return from sick leave ──
+                            if io == 1:  # origin = employment
+                                ev_ret = ((1.0 - sigma_sep) * EV_E[ih, ik_S, idU, itype]
+                                          + sigma_sep * EV_U[ih, ik_S, idU, ib_sep_S, itype])
+                            else:  # origin = unemployment
+                                ev_ret = EV_U[ih, ik_S, idU, ib, itype]
 
-                            # EV: stay U
-                            EV_nfind = 0.0
-                            for ih2 in range(Nh):
-                                EV_nfind += P_h[ih, ih2] * VU[t+1, ih2, ik_U, idU_U, ib, itype]
-
-                            # EV: try going sick → medical check fires at transition.
-                            # Accepted (prob 1-p_doc_out): enter S (dS=0, ir=0, io=0).
-                            # Rejected (prob p_doc_out):   stay in U.
-                            EV_sick = 0.0
-                            for ih2 in range(Nh):
-                                p = P_h[ih, ih2]
-                                pd_out = p_doc_out[ih2]
-                                EV_sick += p * (
-                                    (1.0 - pd_out) * VS[t+1, ih2, ik_U, idU_U, 0, 0, 0, ib, itype]
-                                    + pd_out       * VU[t+1, ih2, ik_U, idU_U, ib, itype]
-                                )
-
-                            # optimal search effort (closed-form FOC)
-                            dV = EV_find - EV_nfind
-                            if dV > 0.0:
-                                s_star = beta * psi * dV / (omh * lam)
-                                if s_star > 1.0:
-                                    s_star = 1.0
+                            # ── Option B: stay on sick leave ──────
+                            at_reassess = (idS == t_reassess - 1) and (ir == 0)
+                            if at_reassess:
+                                ev_stay = EV_S_ra[ih, ik_S, idU, io, ib, itype]
                             else:
-                                s_star = 0.0
+                                ev_stay = EV_S[ih, ik_S, idU, idS_nxt, ir, io, ib, itype]
 
-                            # UI search requirement: workers on UI (dU > 0) must
-                            # search at s ≥ s_bar to receive benefit.
-                            # Welfare recipients (dU = 0) face no requirement.
-                            if idU > 0 and s_star < s_bar:
-                                s_star = s_bar
-
-                            pf        = psi * s_star
-                            srch_cost = 0.5 * omh * lam * s_star * s_star
-                            V_search  = u_U - srch_cost + beta * (pf * EV_find + (1.0 - pf) * EV_nfind)
-                            V_sick    = u_U             + beta * EV_sick
-
-                            if V_sick >= V_search:
-                                VU[t,ih,ik,idU,ib,itype]      = V_sick
-                                g_U_pol[t,ih,ik,idU,ib,itype] = 1.0
-                                s_pol[t,ih,ik,idU,ib,itype]   = 0.0
+                            if ev_ret >= ev_stay:
+                                VS[t,ih,ik,idU,idS,ir,io,ib,itype]      = u_S + beta * ev_ret
+                                ret_pol[t,ih,ik,idU,idS,ir,io,ib,itype] = 1.0
                             else:
-                                VU[t,ih,ik,idU,ib,itype]      = V_search
-                                g_U_pol[t,ih,ik,idU,ib,itype] = 0.0
-                                s_pol[t,ih,ik,idU,ib,itype]   = s_star
+                                VS[t,ih,ik,idU,idS,ir,io,ib,itype]      = u_S + beta * ev_stay
+                                ret_pol[t,ih,ik,idU,idS,ir,io,ib,itype] = 0.0
+
+    # ──────────────────────── V^E ────────────────────────────────────────
+    for idx_E in prange(Ntype * Nh * Nk):
+        itype    = idx_E // (Nh * Nk)
+        ih       = (idx_E % (Nh * Nk)) // Nk
+        ik       = idx_E % Nk
+        nu       = nu_grid[itype]
+        h        = h_grid[ih]
+        dis_work = -nu * (1.0 - h) ** 2 / 2.0
+        ik_E     = ik_next_EH[ik, ih]
+        ib_sep_E = ib_sep_by_ik[ik_E]
+        u_E      = log_w[ik] + dis_work
+        for idU in range(NdU):
+            idU_E = dU_next_E[idU]
+
+            if last:
+                VE[t,ih,ik,idU,itype]      = u_E
+                q_pol[t,ih,ik,idU,itype]   = 0.0
+                g_E_pol[t,ih,ik,idU,itype] = 0.0
+                continue
+
+            # EV: quit → U
+            ev_quit = EV_U[ih, ik_E, idU_E, ib_sep_E, itype]
+
+            # EV: stay E (exogenous separation σ)
+            ev_stay = ((1.0 - sigma_sep) * EV_E[ih, ik_E, idU_E, itype]
+                       + sigma_sep        * EV_U[ih, ik_E, idU_E, ib_sep_E, itype])
+
+            # EV: try going sick (accepted: enter S; rejected: stay in E)
+            ev_sick = (EV_S_enter_E[ih, ik_E, idU_E, ib_sep_E, itype]
+                       + (1.0 - sigma_sep) * EV_doc_E[ih, ik_E, idU_E, itype]
+                       + sigma_sep         * EV_doc_U[ih, ik_E, idU_E, ib_sep_E, itype])
+
+            if ev_quit >= ev_stay:
+                best_ns = ev_quit
+                q_best  = 1.0
+            else:
+                best_ns = ev_stay
+                q_best  = 0.0
+
+            if ev_sick >= best_ns:
+                VE[t,ih,ik,idU,itype]      = u_E + beta * ev_sick
+                g_E_pol[t,ih,ik,idU,itype] = 1.0
+                q_pol[t,ih,ik,idU,itype]   = 0.0
+            else:
+                VE[t,ih,ik,idU,itype]      = u_E + beta * best_ns
+                g_E_pol[t,ih,ik,idU,itype] = 0.0
+                q_pol[t,ih,ik,idU,itype]   = q_best
+
+    # ──────────────────────── V^U ────────────────────────────────────────
+    for idx_U in prange(Ntype * Nh * Nk):
+        itype = idx_U // (Nh * Nk)
+        ih    = (idx_U % (Nh * Nk)) // Nk
+        ik    = idx_U % Nk
+        lam   = lambda_grid[itype]
+        h     = h_grid[ih]
+        omh   = max(1.0 - h, 1e-8)
+        ik_U  = ik_next_U[ik]
+        for idU in range(NdU):
+            idU_U = dU_next_U[idU]
+            for ib in range(Nb):
+                u_U = log_b_U[idU, ib]
+
+                if last:
+                    VU[t,ih,ik,idU,ib,itype]      = u_U
+                    s_pol[t,ih,ik,idU,ib,itype]   = 0.0
+                    g_U_pol[t,ih,ik,idU,ib,itype] = 0.0
+                    continue
+
+                ev_find  = EV_E[ih, ik_U, idU_U, itype]
+                ev_nfind = EV_U[ih, ik_U, idU_U, ib, itype]
+                ev_sick  = (EV_S_enter_U[ih, ik_U, idU_U, ib, itype]
+                            + EV_doc_U[ih, ik_U, idU_U, ib, itype]
+                            + (log_b_floor_val - log_b_U[idU_U, ib]) * E_p_doc_out[ih])
+
+                dV = ev_find - ev_nfind
+                if dV > 0.0:
+                    s_star = beta * psi * dV / (omh * lam)
+                    if s_star > 1.0:
+                        s_star = 1.0
+                else:
+                    s_star = 0.0
+
+                if idU > 0 and s_star < s_bar:
+                    s_star = s_bar
+
+                pf        = psi * s_star
+                srch_cost = 0.5 * omh * lam * s_star * s_star
+                v_search  = u_U - srch_cost + beta * (pf * ev_find + (1.0 - pf) * ev_nfind)
+                v_sick    = u_U             + beta * ev_sick
+
+                if v_sick >= v_search:
+                    VU[t,ih,ik,idU,ib,itype]      = v_sick
+                    g_U_pol[t,ih,ik,idU,ib,itype] = 1.0
+                    s_pol[t,ih,ik,idU,ib,itype]   = 0.0
+                else:
+                    VU[t,ih,ik,idU,ib,itype]      = v_search
+                    g_U_pol[t,ih,ik,idU,ib,itype] = 0.0
+                    s_pol[t,ih,ik,idU,ib,itype]   = s_star
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Numba: forward distribution
 # ─────────────────────────────────────────────────────────────────────────────
 
-@njit
+@njit(cache=True)
 def _forward_distribution(
     T, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype,
     psi, sigma_sep, t_reassess,
@@ -998,7 +1024,7 @@ def _forward_distribution(
 # Numba: unemployment hazard from entry cohort
 # ─────────────────────────────────────────────────────────────────────────────
 
-@njit
+@njit(cache=True, fastmath=True)
 def _hazard_cohort(
     max_d, Nh, Nk, NdU, Nb, Ntype,
     psi, P_h,
@@ -1040,7 +1066,7 @@ def _hazard_cohort(
 # Numba: unemployment cohort — tracks exits to E and exits to S separately
 # ─────────────────────────────────────────────────────────────────────────────
 
-@njit
+@njit(cache=True, fastmath=True)
 def _hazard_cohort_u(
     max_d, Nh, Nk, NdU, Nb, Ntype,
     psi, P_h,
@@ -1096,7 +1122,7 @@ def _hazard_cohort_u(
 # Numba: sick-leave cohort — tracks exits to E and exits to U separately
 # ─────────────────────────────────────────────────────────────────────────────
 
-@njit
+@njit(cache=True, fastmath=True)
 def _hazard_cohort_s(
     max_d, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype,
     sigma_sep, t_reassess,
@@ -1166,3 +1192,51 @@ def _hazard_cohort_s(
         exits_E_out[d-1]  = exits_E
         exits_U_out[d-1]  = exits_U
         cur = nxt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Numba: pooled sick-leave hazard — single pass, parallel over idS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _pooled_hazard_kernel(muS, ret, max_d, sigma_sep):
+    """
+    Single-pass parallel reduction over the full muS / ret arrays.
+    Each idS is handled by its own thread, accumulating local scalars.
+    muS / ret shape: (T, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype)
+    """
+    T, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype = muS.shape
+    at_risk = np.zeros(max_d)
+    from_U  = np.zeros(max_d)
+    from_E  = np.zeros(max_d)
+
+    for idS in prange(max_d):
+        ar = 0.0
+        fu = 0.0
+        fe = 0.0
+        for t in range(T):
+            for ih in range(Nh):
+                for ik in range(Nk):
+                    for idU in range(NdU):
+                        for ir in range(Nr):
+                            for io in range(No):
+                                for ib in range(Nb):
+                                    for itype in range(Ntype):
+                                        m = muS[t, ih, ik, idU, idS, ir, io, ib, itype]
+                                        if m == 0.0:
+                                            continue
+                                        r = ret[t, ih, ik, idU, idS, ir, io, ib, itype]
+                                        ar += m
+                                        if io == 0:
+                                            fu += m * r
+                                        else:
+                                            fe += m * r
+        at_risk[idS] = ar
+        from_U[idS]  = fu
+        from_E[idS]  = fe
+
+    exits_U  = from_U + from_E * sigma_sep
+    exits_E  = from_E * (1.0 - sigma_sep)
+    hazard_E = np.where(at_risk > 0.0, exits_E / at_risk, 0.0)
+    hazard_U = np.where(at_risk > 0.0, exits_U / at_risk, 0.0)
+    return at_risk, exits_E, exits_U, hazard_E, hazard_U
