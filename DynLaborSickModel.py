@@ -37,17 +37,6 @@ def discretize_health_ar1(Nh, rho, sigma_eps, n_std=3.0):
     return h_grid.astype(np.float64), P_h.astype(np.float64)
 
 
-@njit(cache=True)
-def _crra_u(c, mu, eta):
-    """CRRA utility: η·c^(1+µ)/(1+µ).  Limit as µ→-1 is η·log(c)."""
-    if c < 1e-10:
-        c = 1e-10
-    if abs(mu + 1.0) < 1e-10:
-        return eta * np.log(c)
-    else:
-        return eta * c ** (1.0 + mu) / (1.0 + mu)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,8 +88,8 @@ class FullLaborModelClass(EconModelClass):
         par.type_shares  = np.array([0.60, 0.40])
         par.lambda_grid  = np.array([2.0, 4.0])  # search cost scale by type
         par.nu_grid      = np.array([2.0, 5.0])  # work disutility scale by type
-        #   search cost (unemployed):  (1-h)*lambda_n * s^(1+gamma)/(1+gamma)
-        #   work disutility (employed): nu_n * (1-h)^(1+iota)/(1+iota)
+        #   search disutility (unemployed):  -(1-h)*lambda_n * s^2/2
+        #   work  disutility (employed):     -nu_n * (1-h)^2/2
 
         # Initial health distribution: stationary distribution of the health AR(1),
         # shifted in logit z-space per type.  z=0 maps to h=0.5; negative z → lower h.
@@ -114,8 +103,8 @@ class FullLaborModelClass(EconModelClass):
         par.zeta = 2    # re-qualification increment per employment period
 
         par.b_wel  = 0.40   # social assistance (dU = 0)
-        par.b_emp  = 1.0   # high UI benefit (beskæftigelsestillæg)
-        par.bmax   = 0.90   # UI benefit cap
+        par.b_emp  = 1.20   # high UI benefit (beskæftigelsestillæg)
+        par.bmax   = 1.00   # UI benefit cap
 
         # ── UI search requirement ─────────────────────────────────────────────
         # Workers on UI (dU > 0) must search at s ≥ s_bar to receive benefit.
@@ -123,15 +112,6 @@ class FullLaborModelClass(EconModelClass):
         # Workers who find the constraint too costly can escape by going sick.
         par.s_bar  = 0.10   # minimum search effort to keep UI (calibrate to data)
         par.Nb     = 3      # grid size for pinned UI benefit
-
-        # ── utility function ──────────────────────────────────────────────────
-        # Consumption: η·c^(1+µ)/(1+µ)  [µ=-1 → log(c), requires η=1 for log]
-        # Search cost (U): (1-h)·λ·s^(1+γ)/(1+γ)
-        # Work disutility (E): ν·(1-h)^(1+ι)/(1+ι)
-        par.mu    = -1.0   # CRRA curvature (mu=-1 → log utility)
-        par.eta   =  1.0   # utility scale
-        par.gamma =  1.0   # search cost curvature exponent
-        par.iota  =  1.0   # work disutility curvature exponent
 
         # wage base
         par.w = 1.0
@@ -233,17 +213,9 @@ class FullLaborModelClass(EconModelClass):
         par.ib_sep_by_ik = (np.searchsorted(par.b_grid, b_reset_vals)
                              .clip(0, par.Nb - 1).astype(np.int32))
 
-        # ── pre-computed flow utilities (after tax, CRRA) ────────────────────
-        def _u(b):
-            c = max(float(b), 1e-10) * (1.0 - par.tau)
-            c = max(c, 1e-10)
-            if abs(par.mu + 1.0) < 1e-10:
-                return par.eta * np.log(c)
-            else:
-                return par.eta * c ** (1.0 + par.mu) / (1.0 + par.mu)
-
-        # UI benefit utility by (dU, ib)
-        par.u_b_U = np.empty((par.NdU, par.Nb))
+        # ── pre-computed log incomes (after tax) ─────────────────────────────
+        # log UI benefit by (dU, ib)
+        par.log_b_U = np.empty((par.NdU, par.Nb))
         for dU in range(par.NdU):
             for ib in range(par.Nb):
                 if dU == 0:
@@ -252,14 +224,14 @@ class FullLaborModelClass(EconModelClass):
                     b = par.b_emp
                 else:
                     b = par.b_grid[ib]
-                par.u_b_U[dU, ib] = _u(b)
+                par.log_b_U[dU, ib] = np.log(max(b, 1e-10) * (1.0 - par.tau))
 
-        # Sick benefit utility by (dS, ir, ib):
+        # log sick benefit by (dS, ir, ib):
         #   ir=0:  b_grid[ib]  — always full = UI benefit (certified or reassess-high)
         #   ir=1:  b_sick_low  — only at reassessment (dS >= t_reassess); pre-reassess unused
         #   ir=2:  b_floor     — rejected at entry (dS < t_reassess, near-zero)
         #          b_wel       — welfare floor at reassessment (dS >= t_reassess)
-        par.u_b_S = np.empty((par.NdS, par.Nr, par.Nb))
+        par.log_b_S = np.empty((par.NdS, par.Nr, par.Nb))
         for ids in range(par.NdS):
             for ir in range(par.Nr):
                 for ib in range(par.Nb):
@@ -269,7 +241,7 @@ class FullLaborModelClass(EconModelClass):
                         b = par.b_sick_low          # only meaningful post-reassessment
                     else:                            # ir == 2
                         b = par.b_wel if ids >= par.t_reassess else par.b_floor
-                    par.u_b_S[ids, ir, ib] = _u(b)
+                    par.log_b_S[ids, ir, ib] = np.log(max(b, 1e-10) * (1.0 - par.tau))
 
         # ── medical documentation check probabilities ─────────────────────────
         # p_doc_out[ih]: probability of being rejected (ir=2, b_floor) at entry.
@@ -283,9 +255,10 @@ class FullLaborModelClass(EconModelClass):
         # Used for the 1-period zero-benefit penalty for rejected U→S attempts.
         par.E_p_doc_out = par.P_h @ par.p_doc_out
 
-        # wage utility by ik
-        par.u_w = np.array([_u(par.w * (1.0 + par.alpha * k))
-                            for k in par.k_grid], dtype=np.float64)
+        # log wage by ik
+        par.log_w = np.log(
+            (1.0 - par.tau) * par.w * (1.0 + par.alpha * par.k_grid)
+        ).astype(np.float64)
 
         # ── reassessment probabilities by health grid point ───────────────────
         par.p_low = np.empty(par.Nh)
@@ -362,14 +335,6 @@ class FullLaborModelClass(EconModelClass):
         lam_f64 = par.lambda_grid.astype(np.float64)
         nu_f64  = par.nu_grid.astype(np.float64)
 
-        _b_floor_c = float(par.b_floor * (1.0 - par.tau))
-        _b_floor_c = max(_b_floor_c, 1e-10)
-        if abs(par.mu + 1.0) < 1e-10:
-            _u_b_floor = np.float64(par.eta * np.log(_b_floor_c))
-        else:
-            _u_b_floor = np.float64(par.eta * _b_floor_c ** (1.0 + par.mu)
-                                    / (1.0 + par.mu))
-
         for t in range(par.T - 1, -1, -1):
             last = (t == par.T - 1)
 
@@ -417,10 +382,9 @@ class FullLaborModelClass(EconModelClass):
                 par.Nr, par.No, par.Nb, par.Ntype,
                 par.beta, par.psi, par.sigma_sep, par.t_reassess,
                 par.s_bar,
-                np.float64(par.gamma), np.float64(par.iota),
                 lam_f64, nu_f64,
                 par.h_grid,
-                par.u_w, par.u_b_U, par.u_b_S,
+                par.log_w, par.log_b_U, par.log_b_S,
                 par.ik_next_U, par.ik_next_EH,
                 par.dU_next_U, par.dU_next_E,
                 par.dS_next_S,
@@ -428,7 +392,7 @@ class FullLaborModelClass(EconModelClass):
                 EV_E, EV_U, EV_S, EV_S_ra,
                 EV_S_enter_E, EV_S_enter_U, EV_doc_E, EV_doc_U,
                 par.E_p_doc_out,
-                _u_b_floor,
+                np.float64(np.log(par.b_floor * (1.0 - par.tau))),
                 sol.VE, sol.VU, sol.VS,
                 sol.s, sol.g_U, sol.q, sol.g_E, sol.ret,
             )
@@ -492,7 +456,6 @@ class FullLaborModelClass(EconModelClass):
             max_d, par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype,
             par.psi, par.P_h,
             par.ik_next_U, par.dU_next_U,
-            par.p_doc_out,
             sol.s[t0:t0 + max_d],
             sol.g_U[t0:t0 + max_d],
             cohort0,
@@ -635,7 +598,6 @@ class FullLaborModelClass(EconModelClass):
             max_d, par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype,
             par.psi, par.P_h,
             par.ik_next_U, par.dU_next_U,
-            par.p_doc_out,
             sol.s[t0:t0 + max_d],
             sol.g_U[t0:t0 + max_d],
             cohort0,
@@ -769,17 +731,16 @@ def _solve_t(
     t, last,
     Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype,
     beta, psi, sigma_sep, t_reassess, s_bar,
-    gamma, iota,
     lambda_grid, nu_grid,
     h_grid,
-    u_w, u_b_U, u_b_S,
+    log_w, log_b_U, log_b_S,
     ik_next_U, ik_next_EH,
     dU_next_U, dU_next_E,
     dS_next_S,
     ib_sep_by_ik,
     EV_E, EV_U, EV_S, EV_S_ra,
     EV_S_enter_E, EV_S_enter_U, EV_doc_E, EV_doc_U,
-    E_p_doc_out, u_b_floor,
+    E_p_doc_out, log_b_floor_val,
     VE, VU, VS,
     s_pol, g_U_pol, q_pol, g_E_pol, ret_pol,
 ):
@@ -798,7 +759,7 @@ def _solve_t(
                         continue
                     for io in range(No):
                         for ib in range(Nb):
-                            u_S = u_b_S[idS, ir, ib]
+                            u_S = log_b_S[idS, ir, ib]
 
                             if last:
                                 VS[t,ih,ik,idU,idS,ir,io,ib,itype]      = u_S
@@ -833,10 +794,10 @@ def _solve_t(
         ik       = idx_E % Nk
         nu       = nu_grid[itype]
         h        = h_grid[ih]
-        dis_work = -nu * (1.0 - h) ** (1.0 + iota) / (1.0 + iota)
+        dis_work = -nu * (1.0 - h) ** 2 / 2.0
         ik_E     = ik_next_EH[ik, ih]
         ib_sep_E = ib_sep_by_ik[ik_E]
-        u_E      = u_w[ik] + dis_work
+        u_E      = log_w[ik] + dis_work
         for idU in range(NdU):
             idU_E = dU_next_E[idU]
 
@@ -886,7 +847,7 @@ def _solve_t(
         for idU in range(NdU):
             idU_U = dU_next_U[idU]
             for ib in range(Nb):
-                u_U = u_b_U[idU, ib]
+                u_U = log_b_U[idU, ib]
 
                 if last:
                     VU[t,ih,ik,idU,ib,itype]      = u_U
@@ -898,11 +859,11 @@ def _solve_t(
                 ev_nfind = EV_U[ih, ik_U, idU_U, ib, itype]
                 ev_sick  = (EV_S_enter_U[ih, ik_U, idU_U, ib, itype]
                             + EV_doc_U[ih, ik_U, idU_U, ib, itype]
-                            + (u_b_floor - u_b_U[idU_U, ib]) * E_p_doc_out[ih])
+                            + (log_b_floor_val - log_b_U[idU_U, ib]) * E_p_doc_out[ih])
 
                 dV = ev_find - ev_nfind
                 if dV > 0.0:
-                    s_star = (beta * psi * dV / (omh * lam)) ** (1.0 / gamma)
+                    s_star = beta * psi * dV / (omh * lam)
                     if s_star > 1.0:
                         s_star = 1.0
                 else:
@@ -912,7 +873,7 @@ def _solve_t(
                     s_star = s_bar
 
                 pf        = psi * s_star
-                srch_cost = omh * lam * s_star ** (1.0 + gamma) / (1.0 + gamma)
+                srch_cost = 0.5 * omh * lam * s_star * s_star
                 v_search  = u_U - srch_cost + beta * (pf * ev_find + (1.0 - pf) * ev_nfind)
                 v_sick    = u_U             + beta * ev_sick
 
@@ -1060,6 +1021,48 @@ def _forward_distribution(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Numba: unemployment hazard from entry cohort
+# ─────────────────────────────────────────────────────────────────────────────
+
+@njit(cache=True, fastmath=True)
+def _hazard_cohort(
+    max_d, Nh, Nk, NdU, Nb, Ntype,
+    psi, P_h,
+    ik_next_U, dU_next_U,
+    s_pol,       # (max_d, Nh, Nk, NdU, Nb, Ntype)
+    cohort0,     # (Nh, Nk, NdU, Nb, Ntype)
+    hazard_out, at_risk_out, exits_out,
+):
+    cur = cohort0.copy()
+    for d in range(1, max_d + 1):
+        at_risk = 0.0
+        exits   = 0.0
+        nxt = np.zeros_like(cur)
+        for itype in range(Ntype):
+            for ih in range(Nh):
+                ik_U_arr = ik_next_U
+                for ik in range(Nk):
+                    ik_U = ik_U_arr[ik]
+                    for idU in range(NdU):
+                        idU_U = dU_next_U[idU]
+                        for ib in range(Nb):
+                            m = cur[ih, ik, idU, ib, itype]
+                            if m == 0.0:
+                                continue
+                            at_risk += m
+                            s  = s_pol[d-1, ih, ik, idU, ib, itype]
+                            pf = psi * s
+                            exits += m * pf
+                            for ih2 in range(Nh):
+                                nxt[ih2, ik_U, idU_U, ib, itype] += P_h[ih, ih2] * m * (1.0 - pf)
+
+        hazard_out[d-1]  = exits / at_risk if at_risk > 0.0 else 0.0
+        at_risk_out[d-1] = at_risk
+        exits_out[d-1]   = exits
+        cur = nxt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Numba: unemployment cohort — tracks exits to E and exits to S separately
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1068,17 +1071,16 @@ def _hazard_cohort_u(
     max_d, Nh, Nk, NdU, Nb, Ntype,
     psi, P_h,
     ik_next_U, dU_next_U,
-    p_doc_out,  # (Nh,) — rejection probability at next-period health
-    s_pol,      # (max_d, Nh, Nk, NdU, Nb, Ntype)
-    g_U_pol,    # (max_d, Nh, Nk, NdU, Nb, Ntype)
-    cohort0,    # (Nh, Nk, NdU, Nb, Ntype)
+    s_pol,    # (max_d, Nh, Nk, NdU, Nb, Ntype)
+    g_U_pol,  # (max_d, Nh, Nk, NdU, Nb, Ntype)
+    cohort0,  # (Nh, Nk, NdU, Nb, Ntype)
     at_risk_out, exits_E_out, exits_S_out,
 ):
     """
     Propagate a U cohort forward.  At each duration:
-      - g_U=1: worker tries sick leave; accepted (1-p_doc_out) → exits_S,
-        rejected (p_doc_out) → stays in U and continues next period.
-      - g_U=0: searches; psi*s fraction exit to E (exits_E).
+      - g_U=1 workers exit to sick leave (exits_S).
+      - g_U=0 workers search; psi*s fraction exit to E (exits_E).
+      - Both exit types are removed from the at-risk pool.
     """
     cur = cohort0.copy()
     for d in range(1, max_d + 1):
@@ -1099,11 +1101,8 @@ def _hazard_cohort_u(
                             at_risk += m
                             g_U = g_U_pol[d-1, ih, ik, idU, ib, itype]
                             if g_U >= 0.5:
-                                # try sick leave: accepted → exit, rejected → stay in U
-                                for ih2 in range(Nh):
-                                    ph = P_h[ih, ih2] * m
-                                    exits_S += ph * (1.0 - p_doc_out[ih2])
-                                    nxt[ih2, ik_U, idU_U, ib, itype] += ph * p_doc_out[ih2]
+                                # exit to sick leave — removed from cohort
+                                exits_S += m
                             else:
                                 s  = s_pol[d-1, ih, ik, idU, ib, itype]
                                 pf = psi * s

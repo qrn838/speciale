@@ -30,7 +30,7 @@ class UIEmploymentModelClass(EconModelClass):
 
         # UI rights / duration-like state
         par.Ubar = 24         # max UI rights/weeks (discrete)
-        par.J = 3             # high-benefit window length
+        par.J = 0             # high-benefit window length
         par.zeta = 2          # re-qualification increment during employment in Eq (3)
 
         # benefits
