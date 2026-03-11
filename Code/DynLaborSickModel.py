@@ -9,10 +9,11 @@ from numba import njit, prange
 # Tauchen discretization of the logit-AR(1) health process
 # ─────────────────────────────────────────────────────────────────────────────
 
-def discretize_health_ar1(Nh, rho, sigma_eps, n_std=3.0):
+def discretize_health_ar1(Nh, rho, sigma_eps, n_std=3.0, delta=0.0):
     """
-    Discretize  z_{t+1} = rho*z_t + eps,  eps ~ N(0, sigma_eps^2)  via Tauchen.
+    Discretize  z_{t+1} = rho*z_t + delta + eps,  eps ~ N(0, sigma_eps^2)  via Tauchen.
     Health:  h = exp(z) / (1 + exp(z)).
+    delta > 0 shifts health upward (recovery); delta < 0 shifts downward (deterioration).
     Returns h_grid (Nh,) in (0,1) and transition matrix P_h (Nh x Nh).
     """
     sig_z  = sigma_eps / np.sqrt(max(1.0 - rho**2, 1e-12))
@@ -21,7 +22,7 @@ def discretize_health_ar1(Nh, rho, sigma_eps, n_std=3.0):
 
     P_h = np.zeros((Nh, Nh))
     for iz in range(Nh):
-        mu = rho * z_grid[iz]
+        mu = rho * z_grid[iz] + delta
         for jz in range(Nh):
             lo = z_grid[jz] - 0.5 * step
             hi = z_grid[jz] + 0.5 * step
@@ -97,7 +98,7 @@ class FullLaborModelClass(EconModelClass):
         # ── unobserved heterogeneity ─────────────────────────────────────────
         par.Ntype        = 2
         par.type_shares  = np.array([0.60, 0.40])
-        par.lambda_grid  = np.array([2.0, 4.0])  # search cost scale by type
+        par.lambda_grid  = np.array([10.0, 20.0])  # search cost scale by type
         par.nu_grid      = np.array([2.0, 5.0])  # work disutility scale by type
         #   search cost (unemployed):  (1-h)*lambda_n * s^(1+gamma)/(1+gamma)
         #   work disutility (employed): nu_n * (1-h)^(1+iota)/(1+iota)
@@ -124,14 +125,20 @@ class FullLaborModelClass(EconModelClass):
         par.s_bar  = 0.10   # minimum search effort to keep UI (calibrate to data)
         par.Nb     = 3      # grid size for pinned UI benefit
 
+        # ── health-dependent fixed cost of labour market participation ────────
+        # chi*(1-h) is paid when unemployed and required to search (idU > 0).
+        # Represents the physical/mental burden of job searching while ill,
+        # beyond the variable search effort cost. Calibrate to match U→S uptake.
+        par.chi    = 1.0
+
         # ── utility function ──────────────────────────────────────────────────
         # Consumption: η·c^(1+µ)/(1+µ)  [µ=-1 → log(c), requires η=1 for log]
         # Search cost (U): (1-h)·λ·s^(1+γ)/(1+γ)
         # Work disutility (E): ν·(1-h)^(1+ι)/(1+ι)
         par.mu    = -1.0   # CRRA curvature (mu=-1 → log utility)
         par.eta   =  1.0   # utility scale
-        par.gamma =  1.0   # search cost curvature exponent
-        par.iota  =  1.0   # work disutility curvature exponent
+        par.gamma =  0.9   # search cost curvature exponent
+        par.iota  =  0.9   # work disutility curvature exponent
 
         # wage base
         par.w = 1.0
@@ -144,16 +151,17 @@ class FullLaborModelClass(EconModelClass):
         # dS resets to 0 at every new sick spell (no carry-over across U spells).
         par.Sbar        = 24    # max sick duration tracked (capped after this)
         par.t_reassess  = 6     # reassessment at transition dS: t_reassess-1 → t_reassess
-        # Sick leave benefit structure:
-        #   ir=0 (certified / full):    b_grid[ib]  — same as UI entitlement
-        #   ir=1 (reassess low):        b_sick_low  — only possible at reassessment
-        #   ir=2 (rejected at entry):   b_floor     — medical check failed, ≈ 0
-        #   ir=2 (reassess floor):      b_wel       — welfare, only at reassessment
+        # Sick leave benefit structure (ir tracks post-reassessment tier):
+        #   ir=0:  full benefit  b_grid[ib]  — before and after reassessment (high outcome)
+        #   ir=1:  low benefit   b_sick_low  — only possible post-reassessment
+        #   ir=2:  welfare       b_wel       — only possible post-reassessment
+        # Before reassessment only ir=0 exists; ir=1 and ir=2 are skipped by the solver.
         par.b_sick_low  = 0.50  # intermediate benefit at reassessment (ir=1)
-        par.b_floor     = 0.01  # near-zero benefit for rejected-at-entry workers
+        par.b_floor     = 0.01  # income received by U workers rejected at spell entry
 
         # Medical documentation check at spell entry (binary: accept / reject).
-        # Rejected workers (ir=2) get b_floor and immediately prefer to return to UI.
+        # Rejected workers are kicked back to their origin state (never enter VS).
+        # U-origin workers receive b_floor for the rejection period (income penalty).
         # Healthy workers (high h) face a higher rejection probability.
         # delta0_doc must be large enough so even low-health workers face meaningful
         # rejection risk — otherwise it has no effect on the gaming workers
@@ -186,6 +194,13 @@ class FullLaborModelClass(EconModelClass):
 
         # ── health ──────────────────────────────────────────────────────────
         par.h_grid, par.P_h = discretize_health_ar1(par.Nh, par.rho_h, par.sigma_h)
+
+        # Health recovery on sick leave: positive drift on logit scale.
+        # delta_h_S > 0 means health improves faster while on sick leave
+        # than when working or searching.
+        par.delta_h_S = 0.20
+        _, par.P_h_S  = discretize_health_ar1(par.Nh, par.rho_h, par.sigma_h,
+                                               delta=par.delta_h_S)
 
         # ── type-specific initial health distributions ────────────────────────
         # Stationary distribution of the health AR(1) is N(0, sigma_z^2) in logit
@@ -255,10 +270,10 @@ class FullLaborModelClass(EconModelClass):
                 par.u_b_U[dU, ib] = _u(b)
 
         # Sick benefit utility by (dS, ir, ib):
-        #   ir=0:  b_grid[ib]  — always full = UI benefit (certified or reassess-high)
-        #   ir=1:  b_sick_low  — only at reassessment (dS >= t_reassess); pre-reassess unused
-        #   ir=2:  b_floor     — rejected at entry (dS < t_reassess, near-zero)
-        #          b_wel       — welfare floor at reassessment (dS >= t_reassess)
+        #   ir=0:  b_grid[ib]  — full UI entitlement (only active state pre-reassessment)
+        #   ir=1:  b_sick_low  — low benefit; only populated post-reassessment
+        #   ir=2:  b_wel       — welfare; only populated post-reassessment
+        # Pre-reassessment entries for ir>0 are computed but never accessed.
         par.u_b_S = np.empty((par.NdS, par.Nr, par.Nb))
         for ids in range(par.NdS):
             for ir in range(par.Nr):
@@ -272,7 +287,7 @@ class FullLaborModelClass(EconModelClass):
                     par.u_b_S[ids, ir, ib] = _u(b)
 
         # ── medical documentation check probabilities ─────────────────────────
-        # p_doc_out[ih]: probability of being rejected (ir=2, b_floor) at entry.
+        # p_doc_out[ih]: probability of being rejected at spell entry (kick-back to origin).
         par.p_doc_out = np.empty(par.Nh)
         for ih in range(par.Nh):
             h  = par.h_grid[ih]
@@ -348,7 +363,8 @@ class FullLaborModelClass(EconModelClass):
     # ── solve ────────────────────────────────────────────────────────────────
     def solve(self):
         par, sol = self.par, self.sol
-        Ph         = par.P_h                              # (Nh, Nh)
+        Ph         = par.P_h                              # (Nh, Nh) — for E and U states
+        Ph_S       = par.P_h_S                            # (Nh, Nh) — for sick leave (faster recovery)
         p_hi       = 1.0 - par.p_low - par.p_out         # (Nh,)
         ids_nxt_ra = int(par.dS_next_S[par.t_reassess - 1])
 
@@ -378,27 +394,33 @@ class FullLaborModelClass(EconModelClass):
                 VUt1 = sol.VU[t+1]   # (Nh, Nk, NdU, Nb, Ntype)
                 VSt1 = sol.VS[t+1]   # (Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype)
 
-                # Standard expectations: Ph @ V[t+1] along the ih axis
+                # Expectations for E and U states: use standard P_h
                 EV_E = (Ph @ VEt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Ntype)
                 EV_U = (Ph @ VUt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
-                EV_S = (Ph @ VSt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.NdS, par.Nr, par.No, par.Nb, par.Ntype)
+
+                # Expectations for sick-leave state: use P_h_S (faster recovery)
+                EV_S = (Ph_S @ VSt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.NdS, par.Nr, par.No, par.Nb, par.Ntype)
+
+                # EV_E and EV_U as seen from sick leave (for return decisions in VS)
+                EV_E_S = (Ph_S @ VEt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Ntype)
+                EV_U_S = (Ph_S @ VUt1.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
 
                 # Weighted VS at reassessment: p_high*VS_r0 + p_low*VS_r1 + p_out*VS_r2
                 W_ra = (p_hi[:, None, None, None, None, None]      * VSt1[:, :, :, ids_nxt_ra, 0, :, :, :]
                         + par.p_low[:, None, None, None, None, None] * VSt1[:, :, :, ids_nxt_ra, 1, :, :, :]
                         + par.p_out[:, None, None, None, None, None] * VSt1[:, :, :, ids_nxt_ra, 2, :, :, :])
-                EV_S_ra = (Ph @ W_ra.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.No, par.Nb, par.Ntype)
+                EV_S_ra = (Ph_S @ W_ra.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.No, par.Nb, par.Ntype)
 
-                # Medical-check accepted: (1-p_doc_out)*VS at dS=0, ir=0
+                # Medical-check accepted: entering sick leave → use Ph_S
                 W_enter_E = ((1.0 - par.p_doc_out)[:, None, None, None, None]
                              * VSt1[:, :, :, 0, 0, 1, :, :])
-                EV_S_enter_E = (Ph @ W_enter_E.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
+                EV_S_enter_E = (Ph_S @ W_enter_E.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
 
                 W_enter_U = ((1.0 - par.p_doc_out)[:, None, None, None, None]
                              * VSt1[:, :, :, 0, 0, 0, :, :])
-                EV_S_enter_U = (Ph @ W_enter_U.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
+                EV_S_enter_U = (Ph_S @ W_enter_U.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Nb, par.Ntype)
 
-                # Medical-check rejected: p_doc_out*VE and p_doc_out*VU
+                # Medical-check rejected: stay in E or U → use standard Ph
                 W_doc_E = par.p_doc_out[:, None, None, None] * VEt1
                 EV_doc_E = (Ph @ W_doc_E.reshape(par.Nh, -1)).reshape(par.Nh, par.Nk, par.NdU, par.Ntype)
 
@@ -407,6 +429,7 @@ class FullLaborModelClass(EconModelClass):
 
             else:
                 EV_E, EV_U, EV_S, EV_S_ra = _z4, _z5, _z8, _z_ra
+                EV_E_S, EV_U_S = _z4, _z5
                 EV_S_enter_E = EV_S_enter_U = _z5
                 EV_doc_E = _z4
                 EV_doc_U = _z5
@@ -416,7 +439,7 @@ class FullLaborModelClass(EconModelClass):
                 par.Nh, par.Nk, par.NdU, par.NdS,
                 par.Nr, par.No, par.Nb, par.Ntype,
                 par.beta, par.psi, par.sigma_sep, par.t_reassess,
-                par.s_bar,
+                par.s_bar, np.float64(par.chi),
                 np.float64(par.gamma), np.float64(par.iota),
                 lam_f64, nu_f64,
                 par.h_grid,
@@ -426,6 +449,7 @@ class FullLaborModelClass(EconModelClass):
                 par.dS_next_S,
                 par.ib_sep_by_ik,
                 EV_E, EV_U, EV_S, EV_S_ra,
+                EV_E_S, EV_U_S,
                 EV_S_enter_E, EV_S_enter_U, EV_doc_E, EV_doc_U,
                 par.E_p_doc_out,
                 _u_b_floor,
@@ -453,7 +477,7 @@ class FullLaborModelClass(EconModelClass):
             par.T, par.Nh, par.Nk, par.NdU, par.NdS,
             par.Nr, par.No, par.Nb, par.Ntype,
             par.psi, par.sigma_sep, par.t_reassess,
-            par.P_h,
+            par.P_h, par.P_h_S,
             par.ik_next_U, par.ik_next_EH,
             par.dU_next_U, par.dU_next_E,
             par.dS_next_S,
@@ -723,7 +747,8 @@ class FullLaborModelClass(EconModelClass):
 
     def hazard_s_pooled(self, max_d=None):
         """
-        Sick-leave hazard rates pooled across all calendar times and spell origins.
+        Sick-leave hazard rates pooled across all calendar times and spell origins,
+        plus origin-specific rates (E-origin and U-origin separately).
 
         At each duration d (= idS + 1), aggregates all mass currently at that
         sick-leave duration across every period t, then computes:
@@ -749,13 +774,41 @@ class FullLaborModelClass(EconModelClass):
             muS, ret, max_d, par.sigma_sep
         )
 
+        # Origin-specific hazards via numpy.
+        # muS/ret shape: (T, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype)
+        # After selecting io, shape: (T, Nh, Nk, NdU, NdS, Nr, Nb, Ntype)
+        # Sum over all axes except NdS (axis 4): axes (0,1,2,3,5,6,7)
+        _sum = (0, 1, 2, 3, 5, 6, 7)
+        muS_E = muS[:, :, :, :, :, :, 1, :, :]   # E-origin (io=1)
+        muS_U = muS[:, :, :, :, :, :, 0, :, :]   # U-origin (io=0)
+        ret_E = ret[:, :, :, :, :, :, 1, :, :]
+        ret_U = ret[:, :, :, :, :, :, 0, :, :]
+
+        ar_E      = muS_E.sum(axis=_sum)
+        ar_U      = muS_U.sum(axis=_sum)
+        retmass_E = (muS_E * ret_E).sum(axis=_sum)
+        retmass_U = (muS_U * ret_U).sum(axis=_sum)
+
+        ex_E_Eorig = retmass_E * (1.0 - par.sigma_sep)
+        ex_U_Eorig = retmass_E * par.sigma_sep
+        ex_U_Uorig = retmass_U
+
+        hz_E_Eorig = np.where(ar_E > 0, ex_E_Eorig / ar_E, 0.0)
+        hz_U_Eorig = np.where(ar_E > 0, ex_U_Eorig / ar_E, 0.0)
+        hz_U_Uorig = np.where(ar_U > 0, ex_U_Uorig / ar_U, 0.0)
+
         return pd.DataFrame({
-            "duration": np.arange(1, max_d + 1),
-            "at_risk":  at_risk,
-            "exits_E":  exits_E,
-            "exits_U":  exits_U,
-            "hazard_E": hazard_E,
-            "hazard_U": hazard_U,
+            "duration":       np.arange(1, max_d + 1),
+            "at_risk":        at_risk,
+            "at_risk_E":      ar_E,
+            "at_risk_U":      ar_U,
+            "exits_E":        exits_E,
+            "exits_U":        exits_U,
+            "hazard_E":       hazard_E,
+            "hazard_U":       hazard_U,
+            "hazard_E_Eorig": hz_E_Eorig,
+            "hazard_U_Eorig": hz_U_Eorig,
+            "hazard_U_Uorig": hz_U_Uorig,
         })
 
 
@@ -768,7 +821,7 @@ class FullLaborModelClass(EconModelClass):
 def _solve_t(
     t, last,
     Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype,
-    beta, psi, sigma_sep, t_reassess, s_bar,
+    beta, psi, sigma_sep, t_reassess, s_bar, chi,
     gamma, iota,
     lambda_grid, nu_grid,
     h_grid,
@@ -778,6 +831,7 @@ def _solve_t(
     dS_next_S,
     ib_sep_by_ik,
     EV_E, EV_U, EV_S, EV_S_ra,
+    EV_E_S, EV_U_S,
     EV_S_enter_E, EV_S_enter_U, EV_doc_E, EV_doc_U,
     E_p_doc_out, u_b_floor,
     VE, VU, VS,
@@ -798,7 +852,10 @@ def _solve_t(
                         continue
                     for io in range(No):
                         for ib in range(Nb):
-                            u_S = u_b_S[idS, ir, ib]
+                            if io == 1 and ir == 0:
+                                u_S = u_w[ik]
+                            else:
+                                u_S = u_b_S[idS, ir, ib]
 
                             if last:
                                 VS[t,ih,ik,idU,idS,ir,io,ib,itype]      = u_S
@@ -806,11 +863,12 @@ def _solve_t(
                                 continue
 
                             # ── Option A: return from sick leave ──
+                            # Uses EV_E_S / EV_U_S: health transitions while sick (P_h_S)
                             if io == 1:  # origin = employment
-                                ev_ret = ((1.0 - sigma_sep) * EV_E[ih, ik_S, idU, itype]
-                                          + sigma_sep * EV_U[ih, ik_S, idU, ib_sep_S, itype])
+                                ev_ret = ((1.0 - sigma_sep) * EV_E_S[ih, ik_S, idU, itype]
+                                          + sigma_sep * EV_U_S[ih, ik_S, idU, ib_sep_S, itype])
                             else:  # origin = unemployment
-                                ev_ret = EV_U[ih, ik_S, idU, ib, itype]
+                                ev_ret = EV_U_S[ih, ik_S, idU, ib, itype]
 
                             # ── Option B: stay on sick leave ──────
                             at_reassess = (idS == t_reassess - 1) and (ir == 0)
@@ -913,7 +971,9 @@ def _solve_t(
 
                 pf        = psi * s_star
                 srch_cost = omh * lam * s_star ** (1.0 + gamma) / (1.0 + gamma)
-                v_search  = u_U - srch_cost + beta * (pf * ev_find + (1.0 - pf) * ev_nfind)
+                # Fixed health-dependent participation cost: only when search is required
+                part_cost = chi * omh if idU > 0 else 0.0
+                v_search  = u_U - srch_cost - part_cost + beta * (pf * ev_find + (1.0 - pf) * ev_nfind)
                 v_sick    = u_U             + beta * ev_sick
 
                 if v_sick >= v_search:
@@ -934,7 +994,7 @@ def _solve_t(
 def _forward_distribution(
     T, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype,
     psi, sigma_sep, t_reassess,
-    P_h,
+    P_h, P_h_S,
     ik_next_U, ik_next_EH,
     dU_next_U, dU_next_E,
     dS_next_S,
@@ -1034,7 +1094,7 @@ def _forward_distribution(
                                             continue
                                         ret = ret_pol[t, ih, ik, idU, idS, ir, io, ib, itype]
                                         for ih2 in range(Nh):
-                                            ph = P_h[ih, ih2] * m
+                                            ph = P_h_S[ih, ih2] * m
                                             if ph == 0.0:
                                                 continue
                                             if ret >= 0.5:

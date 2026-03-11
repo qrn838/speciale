@@ -685,7 +685,8 @@ class FullLaborModelClass(EconModelClass):
 
     def hazard_s_pooled(self, max_d=None):
         """
-        Sick-leave hazard rates pooled across all calendar times and spell origins.
+        Sick-leave hazard rates pooled across all calendar times and spell origins,
+        plus origin-specific rates (E-origin and U-origin separately).
 
         At each duration d (= idS + 1), aggregates all mass currently at that
         sick-leave duration across every period t, then computes:
@@ -711,13 +712,43 @@ class FullLaborModelClass(EconModelClass):
             muS, ret, max_d, par.sigma_sep
         )
 
+        # Origin-specific hazards via numpy.
+        # muS/ret shape: (T, Nh, Nk, NdU, NdS, Nr, No, Nb, Ntype)
+        # After selecting io, shape: (T, Nh, Nk, NdU, NdS, Nr, Nb, Ntype)
+        # Sum over all axes except NdS (axis 4): axes (0,1,2,3,5,6,7)
+        _sum = (0, 1, 2, 3, 5, 6, 7)
+        muS_E = muS[:, :, :, :, :, :, 1, :, :]   # E-origin (io=1)
+        muS_U = muS[:, :, :, :, :, :, 0, :, :]   # U-origin (io=0)
+        ret_E = ret[:, :, :, :, :, :, 1, :, :]
+        ret_U = ret[:, :, :, :, :, :, 0, :, :]
+
+        ar_E       = muS_E.sum(axis=_sum)
+        ar_U       = muS_U.sum(axis=_sum)
+        retmass_E  = (muS_E * ret_E).sum(axis=_sum)
+        retmass_U  = (muS_U * ret_U).sum(axis=_sum)
+
+        # E-origin: returning workers split by exogenous separation
+        ex_E_Eorig = retmass_E * (1.0 - par.sigma_sep)
+        ex_U_Eorig = retmass_E * par.sigma_sep
+        # U-origin: returning workers go entirely to U
+        ex_U_Uorig = retmass_U
+
+        hz_E_Eorig = np.where(ar_E > 0, ex_E_Eorig / ar_E, 0.0)
+        hz_U_Eorig = np.where(ar_E > 0, ex_U_Eorig / ar_E, 0.0)
+        hz_U_Uorig = np.where(ar_U > 0, ex_U_Uorig / ar_U, 0.0)
+
         return pd.DataFrame({
-            "duration": np.arange(1, max_d + 1),
-            "at_risk":  at_risk,
-            "exits_E":  exits_E,
-            "exits_U":  exits_U,
-            "hazard_E": hazard_E,
-            "hazard_U": hazard_U,
+            "duration":    np.arange(1, max_d + 1),
+            "at_risk":     at_risk,
+            "at_risk_E":   ar_E,
+            "at_risk_U":   ar_U,
+            "exits_E":     exits_E,
+            "exits_U":     exits_U,
+            "hazard_E":    hazard_E,
+            "hazard_U":    hazard_U,
+            "hazard_E_Eorig": hz_E_Eorig,
+            "hazard_U_Eorig": hz_U_Eorig,
+            "hazard_U_Uorig": hz_U_Uorig,
         })
 
 
@@ -759,7 +790,10 @@ def _solve_t(
                         continue
                     for io in range(No):
                         for ib in range(Nb):
-                            u_S = log_b_S[idS, ir, ib]
+                            if io == 1 and ir == 0:
+                                u_S = log_w[ik]
+                            else:
+                                u_S = log_b_S[idS, ir, ib]
 
                             if last:
                                 VS[t,ih,ik,idU,idS,ir,io,ib,itype]      = u_S
