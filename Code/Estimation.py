@@ -2,9 +2,7 @@
 Estimation.py  –  SMM estimator for FullLaborModelClass
 ========================================================
 
-Two-stage estimation
-  Stage 1: Differential Evolution  (global search, bounds-respecting)
-  Stage 2: Nelder-Mead              (local polish from DE solution)
+Estimation via Nelder-Mead optimisation of the SMM objective.
 
 Standard errors via numerical Jacobian of the moment function
   (delta method / sandwich formula for SMM).
@@ -18,7 +16,7 @@ Usage
     data_moments = make_data_moments(...)        # or build dict by hand
 
     est = SMMEstimator(FullLaborModelClass)
-    result = est.estimate(data_moments)
+    result = est.estimate(data_moments, theta0=theta0)
     print(result["table"])
 """
 
@@ -26,7 +24,7 @@ import warnings
 import numpy as np
 import pandas as pd
 from copy import deepcopy
-from scipy.optimize import differential_evolution, minimize
+from scipy.optimize import minimize
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parameter specification
@@ -39,9 +37,6 @@ PARAM_SPEC = [
     ("iota",         0.30,  2.50,  "work disutility curvature"),
     # Health-dependent participation cost
     ("chi",          0.00,  6.00,  "participation cost coefficient"),
-    # Human capital
-    ("alpha",        0.00,  0.30,  "human capital wage return"),
-    ("delta_k",      0.00,  0.25,  "human capital depreciation"),
     # Health dynamics
     ("rho_h",        0.50,  0.995, "health AR(1) persistence"),
     ("sigma_h",      0.05,  1.20,  "health shock std dev"),
@@ -51,6 +46,11 @@ PARAM_SPEC = [
     ("delta1_doc",   0.00,  1.50,  "medical gate slope (health)"),
     # Sick-leave benefit structure
     ("b_sick_low",   0.20,  0.95,  "intermediate benefit post-reassessment"),
+    # Reassessment probabilities — linear in health: P = delta0 + delta1 * h
+    ("delta0_low",  -0.30,  0.80,  "P(reduced benefit | h) intercept"),
+    ("delta1_low",  -1.00,  1.50,  "P(reduced benefit | h) slope"),
+    ("delta0_out",  -0.50,  0.80,  "P(kicked out | h) intercept"),
+    ("delta1_out",   0.00,  2.50,  "P(kicked out | h) slope"),
     # Unobserved heterogeneity — search cost scale
     ("lam0",         0.50,  30.0,  "search cost scale type 0"),
     ("lam1",         0.50,  30.0,  "search cost scale type 1"),
@@ -66,29 +66,6 @@ PARAM_SPEC = [
 PARAM_NAMES  = [p[0] for p in PARAM_SPEC]
 PARAM_BOUNDS = [(p[1], p[2]) for p in PARAM_SPEC]
 N_PARAMS     = len(PARAM_SPEC)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Moment specification
-#   Duration bins for hazard rates (bin edges in periods)
-# ─────────────────────────────────────────────────────────────────────────────
-# U-spell hazard bins: finer at short durations, coarser at long durations
-U_BINS = [1, 2, 3, 4, 5, 6, 9, 12, 18, 24]      # 9 bins
-
-# S-spell hazard bins
-S_BINS = [1, 2, 3, 4, 5, 6, 9, 12, 18, 24]      # 9 bins
-
-
-def _bin_hazard(hazard_series, duration_series, bins):
-    """Average hazard within each duration bin [bins[i], bins[i+1])."""
-    vals = []
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        mask = (duration_series >= lo) & (duration_series < hi)
-        if mask.any():
-            vals.append(float(hazard_series[mask].mean()))
-        else:
-            vals.append(np.nan)
-    return np.array(vals)
 
 
 def _mean_duration_from_hazard(hazard_array):
@@ -123,35 +100,29 @@ def _model_moments(model):
 
     moments = {}
 
-    # ── U → E hazard by duration bin ─────────────────────────────────────────
-    h_ue_bins = _bin_hazard(hz_ue["hazard"].values, dur, U_BINS)
-    for i, v in enumerate(h_ue_bins):
-        moments[f"hz_ue_bin{i}"] = v
+    # ── U → E hazard by duration ──────────────────────────────────────────────
+    for d, v in zip(dur, hz_ue["hazard"].values):
+        moments[f"hz_ue_d{int(d):02d}"] = float(v)
 
-    # ── U → S hazard by duration bin ─────────────────────────────────────────
-    h_us_bins = _bin_hazard(hz_us["hazard"].values, dur, U_BINS)
-    for i, v in enumerate(h_us_bins):
-        moments[f"hz_us_bin{i}"] = v
+    # ── U → S hazard by duration ──────────────────────────────────────────────
+    for d, v in zip(dur, hz_us["hazard"].values):
+        moments[f"hz_us_d{int(d):02d}"] = float(v)
 
-    # ── S → E hazard by duration bin (pooled) ────────────────────────────────
-    h_se_bins = _bin_hazard(hz_s["hazard_E"].values, dur_s, S_BINS)
-    for i, v in enumerate(h_se_bins):
-        moments[f"hz_se_bin{i}"] = v
+    # ── S → E hazard by duration (pooled) ────────────────────────────────────
+    for d, v in zip(dur_s, hz_s["hazard_E"].values):
+        moments[f"hz_se_d{int(d):02d}"] = float(v)
 
-    # ── S → U hazard by duration bin (pooled) ────────────────────────────────
-    h_su_bins = _bin_hazard(hz_s["hazard_U"].values, dur_s, S_BINS)
-    for i, v in enumerate(h_su_bins):
-        moments[f"hz_su_bin{i}"] = v
+    # ── S → U hazard by duration (pooled) ────────────────────────────────────
+    for d, v in zip(dur_s, hz_s["hazard_U"].values):
+        moments[f"hz_su_d{int(d):02d}"] = float(v)
 
     # ── S → E by origin ──────────────────────────────────────────────────────
-    h_se_E_bins = _bin_hazard(hz_s["hazard_E_Eorig"].values, dur_s, S_BINS)
-    for i, v in enumerate(h_se_E_bins):
-        moments[f"hz_se_Eorig_bin{i}"] = v
+    for d, v in zip(dur_s, hz_s["hazard_E_Eorig"].values):
+        moments[f"hz_se_Eorig_d{int(d):02d}"] = float(v)
 
     # ── S → U by origin ──────────────────────────────────────────────────────
-    h_su_U_bins = _bin_hazard(hz_s["hazard_U_Uorig"].values, dur_s, S_BINS)
-    for i, v in enumerate(h_su_U_bins):
-        moments[f"hz_su_Uorig_bin{i}"] = v
+    for d, v in zip(dur_s, hz_s["hazard_U_Uorig"].values):
+        moments[f"hz_su_Uorig_d{int(d):02d}"] = float(v)
 
     # ── Average durations ─────────────────────────────────────────────────────
     moments["avg_u_dur"]    = _mean_duration_from_hazard(
@@ -222,20 +193,21 @@ def make_data_moments(
     """
     moments = {}
 
-    def _add_hazard(df, key_prefix, bins):
+    def _add_hazard(df, key_prefix):
         if df is None:
             return
-        h_bins = _bin_hazard(df["hazard"].values, df["duration"].values, bins)
-        for i, v in enumerate(h_bins):
+        for _, row in df.iterrows():
+            d = int(row["duration"])
+            v = float(row["hazard"])
             if not np.isnan(v):
-                moments[f"{key_prefix}_bin{i}"] = v
+                moments[f"{key_prefix}_d{d:02d}"] = v
 
-    _add_hazard(hz_ue_df,       "hz_ue",         U_BINS)
-    _add_hazard(hz_us_df,       "hz_us",         U_BINS)
-    _add_hazard(hz_se_df,       "hz_se",         S_BINS)
-    _add_hazard(hz_su_df,       "hz_su",         S_BINS)
-    _add_hazard(hz_se_Eorig_df, "hz_se_Eorig",   S_BINS)
-    _add_hazard(hz_su_Uorig_df, "hz_su_Uorig",   S_BINS)
+    _add_hazard(hz_ue_df,       "hz_ue")
+    _add_hazard(hz_us_df,       "hz_us")
+    _add_hazard(hz_se_df,       "hz_se")
+    _add_hazard(hz_su_df,       "hz_su")
+    _add_hazard(hz_se_Eorig_df, "hz_se_Eorig")
+    _add_hazard(hz_su_Uorig_df, "hz_su_Uorig")
 
     for name, val in [
         ("avg_u_dur",       avg_u_dur),
@@ -315,10 +287,14 @@ class SMMEstimator:
         model.allocate()
         return model
 
-    def _run_model(self, theta):
+    def _run_model(self, theta, override_par=None):
         """Build, solve, and simulate model. Returns model or None on failure."""
         try:
             model = self._build_model(theta)
+            if override_par:
+                for k, v in override_par.items():
+                    setattr(model.par, k, v)
+                model.allocate()   # recompute grids with overridden parameters
             model.solve()
             model.simulate()
             return model
@@ -401,17 +377,13 @@ class SMMEstimator:
         self,
         data_moments,
         W=None,
-        de_maxiter=500,
-        de_popsize=15,
-        de_seed=42,
-        de_tol=1e-5,
-        polish_with_nelder=True,
+        theta0=None,
+        nm_maxiter=5000,
+        progress_every=5,
         verbose=False,
     ):
         """
-        Run two-stage SMM:
-          1. Differential Evolution  (global)
-          2. Nelder-Mead             (local polish)
+        Estimate parameters by minimising the SMM objective with Nelder-Mead.
 
         Parameters
         ----------
@@ -419,77 +391,63 @@ class SMMEstimator:
             Output of make_data_moments() or a manually constructed dict.
         W : ndarray or None
             Weighting matrix (None → identity).
-        de_maxiter : int
-            Max DE iterations.
-        de_popsize : int
-            DE population size multiplier.
-        de_seed : int
-            Random seed for DE.
-        de_tol : float
-            DE convergence tolerance.
-        polish_with_nelder : bool
-            Whether to run Nelder-Mead after DE.
+        theta0 : array-like
+            Starting values (required).
+        nm_maxiter : int
+            Max Nelder-Mead iterations.
+        progress_every : int
+            Print best Q every this many function evaluations (0 = off).
         verbose : bool
-            Print each objective evaluation.
+            Print Q at every single evaluation.
 
         Returns
         -------
         dict with keys:
-            "theta"      : best parameter vector
-            "Q"          : objective value
-            "table"      : DataFrame with estimates and bounds
-            "de_result"  : raw DE OptimizeResult
-            "nm_result"  : raw Nelder-Mead OptimizeResult (or None)
+            "theta"     : best parameter vector
+            "Q"         : objective value at best theta
+            "table"     : DataFrame with estimates and bounds
+            "nm_result" : raw Nelder-Mead OptimizeResult
         """
-        obj = lambda theta: self.objective(theta, data_moments, W, verbose)
+        if theta0 is None:
+            raise ValueError("theta0 must be provided")
 
-        print("Stage 1: Differential Evolution")
-        print(f"  parameters: {len(self.param_names)}, "
-              f"popsize: {de_popsize}, maxiter: {de_maxiter}")
+        _n_evals = [0]
+        _best_Q  = [1e10]
 
-        de_result = differential_evolution(
-            obj,
-            bounds        = self.param_bounds,
-            maxiter       = de_maxiter,
-            popsize       = de_popsize,
-            tol           = de_tol,
-            seed          = de_seed,
-            mutation      = (0.5, 1.0),   # dithering
-            recombination = 0.7,
-            strategy      = "best1bin",
-            init          = "latinhypercube",
-            polish        = False,        # we do our own polish
-            disp          = True,
+        def _obj(theta):
+            _n_evals[0] += 1
+            Q = self.objective(theta, data_moments, W, verbose)
+            if Q < _best_Q[0]:
+                _best_Q[0] = Q
+            if progress_every and _n_evals[0] % progress_every == 0:
+                print(f"  eval {_n_evals[0]:5d}  |  best Q = {_best_Q[0]:.6f}")
+            return Q
+
+        def _nm_cb(xk):
+            print(f"  iter {_n_evals[0]:5d} evals  |  best Q = {_best_Q[0]:.6f}")
+
+        print(f"Nelder-Mead  ({len(self.param_names)} parameters)")
+        nm_result = minimize(
+            _obj,
+            x0       = np.asarray(theta0, dtype=float),
+            method   = "Nelder-Mead",
+            callback = _nm_cb,
+            options  = {
+                "maxiter":  nm_maxiter,
+                "xatol":    1e-5,
+                "fatol":    1e-6,
+                "disp":     True,
+                "adaptive": True,
+            },
         )
-        theta_de = de_result.x
-        print(f"  DE done: Q={de_result.fun:.6f}")
-
-        nm_result = None
-        theta_best = theta_de
-
-        if polish_with_nelder:
-            print("\nStage 2: Nelder-Mead polish")
-            nm_result = minimize(
-                obj,
-                x0      = theta_de,
-                method  = "Nelder-Mead",
-                options = {
-                    "maxiter": 5000,
-                    "xatol":   1e-5,
-                    "fatol":   1e-6,
-                    "disp":    True,
-                    "adaptive": True,
-                },
-            )
-            theta_best = nm_result.x
-            print(f"  NM done: Q={nm_result.fun:.6f}")
+        theta_best = nm_result.x
+        print(f"  done: Q = {nm_result.fun:.6f}")
 
         table = self._make_table(theta_best)
         return {
             "theta":     theta_best,
-            "Q":         float(self.objective(theta_best, data_moments, W)),
+            "Q":         float(nm_result.fun),
             "table":     table,
-            "de_result": de_result,
             "nm_result": nm_result,
         }
 
@@ -653,6 +611,79 @@ class SMMEstimator:
                                "display.max_colwidth", 40):
             print(table.to_string())
         return table
+
+    # ── hazard fit plot ───────────────────────────────────────────────────────
+
+    def plot_fit(self, theta, data_moments, figsize=None, override_par=None):
+        """
+        Plot simulated vs empirical hazard rates for every moment group
+        present in data_moments.
+
+        Each distinct moment prefix (the part before '_bin') gets its own
+        panel so it is easy to see where the model fits well or poorly.
+
+        Parameters
+        ----------
+        theta : array-like
+        data_moments : dict
+        figsize : tuple or None  (auto-sized if None)
+
+        Returns
+        -------
+        matplotlib Figure
+        """
+        import matplotlib.pyplot as plt
+        from collections import defaultdict
+
+        model = self._run_model(theta, override_par=override_par)
+        if model is None:
+            print("Model failed — cannot plot fit.")
+            return None
+
+        model_mom = _model_moments(model)
+        _, _, keys = self._align_moments(model_mom, data_moments)
+
+        # Group keys by prefix (everything before the last '_d')
+        groups = defaultdict(list)
+        for k in keys:
+            prefix = k.rsplit('_d', 1)[0] if '_d' in k else '__scalars__'
+            groups[prefix].append(k)
+
+        n_panels = len(groups)
+        if figsize is None:
+            figsize = (4.5 * n_panels, 4)
+
+        fig, axes = plt.subplots(1, n_panels, figsize=figsize, squeeze=False)
+        axes = axes[0]
+
+        TITLES = {
+            'hz_ue':          'U → E  (job finding)',
+            'hz_us':          'U → S  (sick-leave entry)',
+            'hz_se':          'S → E  (return to work, pooled)',
+            'hz_su':          'S → U  (exit to unemp., pooled)',
+            'hz_se_Eorig':    'S → E  (E-origin workers)',
+            'hz_su_Uorig':    'S → U  (U-origin workers)',
+            '__scalars__':    'Scalar moments',
+        }
+
+        for ax, (prefix, ks) in zip(axes, groups.items()):
+            # Extract duration from key suffix (e.g. 'hz_se_d03' → 3)
+            durations = [int(k.split('_d')[-1]) for k in ks]
+            d_vals    = [data_moments[k] for k in ks]
+            m_vals    = [model_mom[k]    for k in ks]
+
+            ax.plot(durations, d_vals, 'o-',  color='darkred',   label='Data',  lw=1.8, ms=5)
+            ax.plot(durations, m_vals, 's--', color='steelblue', label='Model', lw=1.8, ms=5)
+            ax.set_title(TITLES.get(prefix, prefix.replace('_', ' ')), fontsize=10)
+            ax.set_xlabel('Duration (months)', fontsize=9)
+            ax.set_ylabel('Hazard rate', fontsize=9)
+            ax.legend(fontsize=9)
+            ax.set_ylim(bottom=0)
+            ax.grid(axis='y', alpha=0.3)
+
+        fig.tight_layout()
+        plt.show()
+        return fig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
