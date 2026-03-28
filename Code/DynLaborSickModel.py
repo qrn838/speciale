@@ -116,7 +116,7 @@ class FullLaborModelClass(EconModelClass):
 
         par.b_wel  = 0.40   # social assistance (dU = 0)
         par.b_emp  = 1.0   # high UI benefit (beskæftigelsestillæg)
-        par.bmax   = 0.90   # UI benefit cap
+        par.bmax   = 0.77   # UI benefit cap
 
         # ── UI search requirement ─────────────────────────────────────────────
         # Workers on UI (dU > 0) must search at s ≥ s_bar to receive benefit.
@@ -142,7 +142,7 @@ class FullLaborModelClass(EconModelClass):
         # If True: U-origin sick workers can search for a job at standard cost
         # (1-h)*lambda*s^(1+gamma)/(1+gamma) with no minimum effort requirement.
         # If found, they exit directly to E without returning to U first.
-        par.search_on_sick = False
+        par.search_on_sick = True
 
         # ── utility function ──────────────────────────────────────────────────
         # Consumption: η·c^(1+µ)/(1+µ)  [µ=-1 → log(c), requires η=1 for log]
@@ -162,19 +162,21 @@ class FullLaborModelClass(EconModelClass):
 
         # ── sickness leave ───────────────────────────────────────────────────
         # dS resets to 0 at every new sick spell (no carry-over across U spells).
-        par.Sbar        = 24    # max sick duration tracked (capped after this)
-        par.t_reassess  = 6     # reassessment at transition dS: t_reassess-1 → t_reassess
+        par.Sbar        = 30    # max sick duration tracked (capped after this)
+        par.t_reassess  = 7     # reassessment at transition dS: t_reassess-1 → t_reassess
         # Sick leave benefit structure (ir tracks post-reassessment tier):
         #   ir=0:  full benefit  b_grid[ib]  — before and after reassessment (high outcome)
         #   ir=1:  low benefit   b_sick_low  — only possible post-reassessment
         #   ir=2:  welfare       b_wel       — only possible post-reassessment
         # Before reassessment only ir=0 exists; ir=1 and ir=2 are skipped by the solver.
-        par.b_sick_low  = 0.50  # intermediate benefit at reassessment (ir=1)
-        par.b_floor     = 0.01  # income received by U workers rejected at spell entry
+        par.b_sick_low    = 0.50  # intermediate benefit at reassessment (ir=1)
+        par.b_floor       = 0.01  # income received by U workers rejected at spell entry
+        par.entry_penalty = True  # if False, rejected U workers receive bmax (no penalty)
 
         # Medical documentation check at spell entry (binary: accept / reject).
         # Rejected workers are kicked back to their origin state (never enter VS).
-        # U-origin workers receive b_floor for the rejection period (income penalty).
+        # U-origin workers receive b_floor for the rejection period (income penalty)
+        # unless entry_penalty=False, in which case rejection has no income cost.
         # Healthy workers (high h) face a higher rejection probability.
         # delta0_doc must be large enough so even low-health workers face meaningful
         # rejection risk — otherwise it has no effect on the gaming workers
@@ -380,7 +382,8 @@ class FullLaborModelClass(EconModelClass):
     def solve(self):
         par, sol = self.par, self.sol
 
-        _b_floor_c = float(par.b_floor * (1.0 - par.tau))
+        _b_floor_val = par.b_floor if par.entry_penalty else par.bmax
+        _b_floor_c = float(_b_floor_val * (1.0 - par.tau))
         _b_floor_c = max(_b_floor_c, 1e-10)
         if abs(par.mu + 1.0) < 1e-10:
             _u_b_floor = np.float64(par.eta * np.log(_b_floor_c))
@@ -770,6 +773,39 @@ class FullLaborModelClass(EconModelClass):
             "hazard_U_Uorig": hz_U_Uorig,
             "hazard_E_Uorig": hz_E_Uorig,
         })
+
+    def avg_durations(self):
+        """
+        Return average unemployment and sick-leave durations.
+
+        Uses the discrete survival identity:
+            E[D] = 1 + S(1) + S(2) + ...
+        where S(d) = prod_{j=1}^{d} (1 - h_j) is the survivor function
+        and h_j is the total exit hazard at duration j.
+
+        Returns
+        -------
+        dict with keys:
+            "avg_u_dur"  : average unemployment duration (months)
+            "avg_s_dur"  : average sick-leave duration (months)
+            "avg_s_dur_Eorig" : average sick-leave duration for E-origin spells
+            "avg_s_dur_Uorig" : average sick-leave duration for U-origin spells
+        """
+        def _mean_dur(h):
+            h = np.clip(np.asarray(h, dtype=float), 0.0, 1.0)
+            S = np.cumprod(1.0 - h)
+            return float(1.0 + S[:-1].sum())
+
+        hz_ue = self.hazard_u_to_e(t0=0)
+        hz_us = self.hazard_u_to_s(t0=0)
+        hz_s  = self.hazard_s_pooled()
+
+        return {
+            "avg_u_dur":       _mean_dur(hz_ue["hazard"].values + hz_us["hazard"].values),
+            "avg_s_dur":       _mean_dur(hz_s["hazard_E"].values + hz_s["hazard_U"].values),
+            "avg_s_dur_Eorig": _mean_dur(hz_s["hazard_E_Eorig"].values + hz_s["hazard_U_Eorig"].values),
+            "avg_s_dur_Uorig": _mean_dur(hz_s["hazard_U_Uorig"].values + hz_s["hazard_E_Uorig"].values),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

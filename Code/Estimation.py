@@ -41,16 +41,19 @@ PARAM_SPEC = [
     ("rho_h",        0.50,  0.995, "health AR(1) persistence"),
     ("sigma_h",      0.05,  1.20,  "health shock std dev"),
     ("delta_h_S",   -0.10,  1.00,  "health recovery drift on sick leave"),
-    # Medical documentation gate
-    ("delta0_doc",   0.00,  0.60,  "medical gate intercept"),
-    ("delta1_doc",   0.00,  1.50,  "medical gate slope (health)"),
+    # Medical documentation gate — quadratic in health: P = delta0 + delta1*h + delta2*h²
+    ("delta0_doc",  -0.20,  0.60,  "medical gate intercept"),
+    ("delta1_doc",  -1.00,  2.00,  "medical gate slope (health)"),
+    ("delta2_doc",  -2.00,  2.00,  "medical gate curvature (health²)"),
     # Sick-leave benefit structure
     ("b_sick_low",   0.20,  0.95,  "intermediate benefit post-reassessment"),
-    # Reassessment probabilities — linear in health: P = delta0 + delta1 * h
+    # Reassessment probabilities — quadratic in health: P = delta0 + delta1*h + delta2*h²
     ("delta0_low",  -0.30,  0.80,  "P(reduced benefit | h) intercept"),
     ("delta1_low",  -1.00,  1.50,  "P(reduced benefit | h) slope"),
+    ("delta2_low",  -2.00,  2.00,  "P(reduced benefit | h) curvature"),
     ("delta0_out",  -0.50,  0.80,  "P(kicked out | h) intercept"),
     ("delta1_out",   0.00,  2.50,  "P(kicked out | h) slope"),
+    ("delta2_out",  -2.00,  2.00,  "P(kicked out | h) curvature"),
     # Unobserved heterogeneity — search cost scale
     ("lam0",         0.50,  30.0,  "search cost scale type 0"),
     ("lam1",         0.50,  30.0,  "search cost scale type 1"),
@@ -224,6 +227,45 @@ def make_data_moments(
     return moments
 
 
+def make_weight_matrix(se_dict, data_moments):
+    """
+    Build an inverse-variance diagonal weight matrix aligned to data_moments.
+
+    Each moment is weighted by 1/se², then normalised so the mean weight
+    equals 1 (keeping Q on the same scale as the identity-weighted case).
+    Moments absent from se_dict receive weight 1.0 before normalisation.
+
+    Parameters
+    ----------
+    se_dict : dict  {moment_key: standard_error}
+        Standard errors from the empirical hazard estimation.
+    data_moments : dict  {moment_key: value}
+        Output of make_data_moments().
+
+    Returns
+    -------
+    dict  {moment_key: weight}
+        Pass directly to SMMEstimator.estimate() / .objective() as W.
+
+    Example
+    -------
+    >>> se_dict = {f"hz_ue_d{d:02d}": se  for d, se in zip(durations, se_vals)}
+    >>> W = make_weight_matrix(se_dict, data_moments)
+    >>> result = est.estimate(data_moments, W=W, theta0=theta0)
+    """
+    raw = {}
+    for k in data_moments:
+        se = se_dict.get(k, None)
+        if se is not None and se > 0:
+            raw[k] = 1.0 / (se ** 2)
+        else:
+            raw[k] = 1.0
+
+    # Normalise so mean weight = 1
+    mean_w = np.mean(list(raw.values()))
+    return {k: v / mean_w for k, v in raw.items()}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SMM Estimator
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,8 +401,12 @@ class SMMEstimator:
         dev = m_vec - d_vec
         if W is None:
             Q = float(dev @ dev)
+        elif isinstance(W, dict):
+            # Dict-based weights: extract 1-d weight vector aligned to keys
+            w = np.array([W.get(k, 1.0) for k in keys])
+            Q = float(dev * w @ dev)
         else:
-            # Subset W to matched keys if needed
+            # Legacy: numpy diagonal matrix — subset to matched keys if needed
             if W.shape[0] == len(keys):
                 Q = float(dev @ W @ dev)
             else:
@@ -614,7 +660,7 @@ class SMMEstimator:
 
     # ── hazard fit plot ───────────────────────────────────────────────────────
 
-    def plot_fit(self, theta, data_moments, figsize=None, override_par=None):
+    def plot_fit(self, theta, data_moments, figsize=None, override_par=None, ci_dict=None):
         """
         Plot simulated vs empirical hazard rates for every moment group
         present in data_moments.
@@ -627,6 +673,9 @@ class SMMEstimator:
         theta : array-like
         data_moments : dict
         figsize : tuple or None  (auto-sized if None)
+        ci_dict : dict or None
+            {moment_key: (lower, upper)} confidence interval bounds.
+            When provided, a shaded band is drawn around the empirical series.
 
         Returns
         -------
@@ -672,8 +721,12 @@ class SMMEstimator:
             d_vals    = [data_moments[k] for k in ks]
             m_vals    = [model_mom[k]    for k in ks]
 
-            ax.plot(durations, d_vals, 'o-',  color='darkred',   label='Data',  lw=1.8, ms=5)
-            ax.plot(durations, m_vals, 's--', color='steelblue', label='Model', lw=1.8, ms=5)
+            ax.plot(durations, d_vals, '-',  color='darkred',   label='Data',  lw=1.8, ms=5)
+            if ci_dict is not None:
+                lo = [ci_dict[k][0] if k in ci_dict else np.nan for k in ks]
+                hi = [ci_dict[k][1] if k in ci_dict else np.nan for k in ks]
+                ax.fill_between(durations, lo, hi, color='darkred', alpha=0.15)
+            ax.plot(durations, m_vals, '--', color='tan', label='Model', lw=1.8, ms=5)
             ax.set_title(TITLES.get(prefix, prefix.replace('_', ' ')), fontsize=10)
             ax.set_xlabel('Duration (months)', fontsize=9)
             ax.set_ylabel('Hazard rate', fontsize=9)
@@ -682,7 +735,6 @@ class SMMEstimator:
             ax.grid(axis='y', alpha=0.3)
 
         fig.tight_layout()
-        plt.show()
         return fig
 
 
