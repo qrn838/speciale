@@ -31,8 +31,7 @@ from scipy.optimize import minimize
 #   (name, lower_bound, upper_bound, description)
 # ─────────────────────────────────────────────────────────────────────────────
 PARAM_SPEC = [
-    # Job-finding / search technology
-    ("psi",          0.05,  1.50,  "job-finding scale"),
+    # Job-finding / search technology  (psi calibrated, not estimated)
     ("gamma",        0.30,  2.50,  "search cost curvature"),
     ("iota",         0.30,  2.50,  "work disutility curvature"),
     # Health-dependent participation cost
@@ -146,6 +145,19 @@ def _model_moments(model):
     ar_T = hz_s["at_risk"].values.sum()
     moments["share_S_Eorig"] = float(ar_E / ar_T) if ar_T > 0 else 0.0
 
+    # ── Average compensation rate at UI entry ─────────────────────────────────
+    # For each k level: comp_rate = min(repl_rate*wage, bmax) / wage
+    # Weighted by the employment mass at each k level (time-averaged).
+    par = model.par
+    wages      = par.w * (1.0 + par.alpha * par.k_grid)        # (Nk,)
+    benefits   = np.minimum(par.repl_rate * wages, par.bmax)   # (Nk,)
+    comp_rates = benefits / wages                               # (Nk,)
+    emp_by_k   = model.sim.muE.sum(axis=(0, 1, 3, 4))          # sum over T,Nh,NdU,Ntype → (Nk,)
+    emp_total  = emp_by_k.sum()
+    moments["avg_comp_rate"] = float(
+        (comp_rates * emp_by_k).sum() / emp_total
+    ) if emp_total > 1e-12 else np.nan
+
     # ── Exhaustion spike: ratio of U→E hazard at exhaustion vs 6 periods before
     #    (captures the incentive effect of UI cliff)                            ─
     ubar = model.par.Ubar
@@ -200,10 +212,11 @@ def make_data_moments(
         if df is None:
             return
         for _, row in df.iterrows():
-            d = int(row["duration"])
+            d = int(round(float(row["duration"])))
             v = float(row["hazard"])
-            if not np.isnan(v):
-                moments[f"{key_prefix}_d{d:02d}"] = v
+            if d < 1 or np.isnan(v) or v == 0:
+                continue
+            moments[f"{key_prefix}_d{d:02d}"] = v
 
     _add_hazard(hz_ue_df,       "hz_ue")
     _add_hazard(hz_us_df,       "hz_us")
@@ -735,6 +748,7 @@ class SMMEstimator:
             ax.grid(axis='y', alpha=0.3)
 
         fig.tight_layout()
+        plt.close(fig)
         return fig
 
 

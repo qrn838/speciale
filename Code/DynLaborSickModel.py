@@ -114,9 +114,13 @@ class FullLaborModelClass(EconModelClass):
         par.J    = 3    # beskæftigelsestillæg window (last J periods of spell)
         par.zeta = 2    # re-qualification increment per employment period
 
-        par.b_wel  = 0.40   # social assistance (dU = 0)
-        par.b_emp  = 1.0   # high UI benefit (beskæftigelsestillæg)
-        par.bmax   = 0.77   # UI benefit cap
+        par.b_wel     = 0.40   # social assistance (dU = 0)
+        par.b_emp     = 0.77    # high UI benefit (beskæftigelsestillæg)
+        par.bmax      = 0.65   # UI benefit cap  (= 77% of avg wage if w_avg ≈ 1)
+        par.repl_rate = 0.80   # UI replacement rate at spell entry: benefit = min(repl_rate*wage, bmax)
+        # Calibration targets:
+        #   bmax / E[wage] = 0.77  →  bmax = 0.77 * w_avg
+        #   E[min(repl_rate*wage, bmax)] / E[wage] = 0.60  →  tune repl_rate
 
         # ── UI search requirement ─────────────────────────────────────────────
         # Workers on UI (dU > 0) must search at s ≥ s_bar to receive benefit.
