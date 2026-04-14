@@ -31,38 +31,44 @@ from scipy.optimize import minimize
 #   (name, lower_bound, upper_bound, description)
 # ─────────────────────────────────────────────────────────────────────────────
 PARAM_SPEC = [
-    # Job-finding / search technology  (psi calibrated, not estimated)
+    # Job-finding / search technology
+    ("psi",          0.10,  5.00,  "job-finding scale"),
     ("gamma",        0.30,  2.50,  "search cost curvature"),
     ("iota",         0.30,  2.50,  "work disutility curvature"),
     # Health-dependent participation cost
     ("chi",          0.00,  6.00,  "participation cost coefficient"),
-    # Health dynamics
-    ("rho_h",        0.50,  0.995, "health AR(1) persistence"),
-    ("sigma_h",      0.05,  1.20,  "health shock std dev"),
-    ("delta_h_S",   -0.10,  1.00,  "health recovery drift on sick leave"),
-    # Medical documentation gate — quadratic in health: P = delta0 + delta1*h + delta2*h²
-    ("delta0_doc",  -0.20,  0.60,  "medical gate intercept"),
-    ("delta1_doc",  -1.00,  2.00,  "medical gate slope (health)"),
-    ("delta2_doc",  -2.00,  2.00,  "medical gate curvature (health²)"),
-    # Sick-leave benefit structure
-    ("b_sick_low",   0.20,  0.95,  "intermediate benefit post-reassessment"),
-    # Reassessment probabilities — quadratic in health: P = delta0 + delta1*h + delta2*h²
-    ("delta0_low",  -0.30,  0.80,  "P(reduced benefit | h) intercept"),
-    ("delta1_low",  -1.00,  1.50,  "P(reduced benefit | h) slope"),
-    ("delta2_low",  -2.00,  2.00,  "P(reduced benefit | h) curvature"),
-    ("delta0_out",  -0.50,  0.80,  "P(kicked out | h) intercept"),
-    ("delta1_out",   0.00,  2.50,  "P(kicked out | h) slope"),
-    ("delta2_out",  -2.00,  2.00,  "P(kicked out | h) curvature"),
+    # E-origin medical gate — linear in health: P = delta0 + delta1*h
+    ("delta0_doc",  -0.20,  0.60,  "E-origin medical gate intercept"),
+    ("delta1_doc",  -1.00,  2.00,  "E-origin medical gate slope (health)"),
+    # U-origin medical gate (separate screening probabilities for U workers)
+    ("delta0_doc_U", -0.20, 0.60,  "U-origin medical gate intercept"),
+    ("delta1_doc_U", -1.00, 2.00,  "U-origin medical gate slope (health)"),
+    # E-origin reassessment probabilities — linear in health
+    ("delta0_low",  -0.30,  0.80,  "E-origin P(reduced benefit | h) intercept"),
+    ("delta1_low",  -1.00,  1.50,  "E-origin P(reduced benefit | h) slope"),
+    ("delta0_out",  -0.50,  0.80,  "E-origin P(kicked out | h) intercept"),
+    ("delta1_out",   0.00,  2.50,  "E-origin P(kicked out | h) slope"),
+    # U-origin reassessment probabilities (may differ from E-origin)
+    ("delta0_low_U", -0.30, 0.80,  "U-origin P(reduced benefit | h) intercept"),
+    ("delta1_low_U", -1.00, 1.50,  "U-origin P(reduced benefit | h) slope"),
+    ("delta0_out_U", -0.50, 0.80,  "U-origin P(kicked out | h) intercept"),
+    ("delta1_out_U",  0.00, 2.50,  "U-origin P(kicked out | h) slope"),
     # Unobserved heterogeneity — search cost scale
-    ("lam0",         0.50,  30.0,  "search cost scale type 0"),
-    ("lam1",         0.50,  30.0,  "search cost scale type 1"),
+    ("lam0",         0.50, 100.0,  "search cost scale type 0"),
+    ("lam1",         0.50, 100.0,  "search cost scale type 1"),
     # Unobserved heterogeneity — work disutility scale
-    ("nu0",          0.01,  5.00,  "work disutility scale type 0"),
-    ("nu1",          0.01,  5.00,  "work disutility scale type 1"),
+    ("nu0",          0.01,  15.0,  "work disutility scale type 0"),
+    ("nu1",          0.01,  15.0,  "work disutility scale type 1"),
     # Type distribution
     ("type_share1",  0.05,  0.95,  "population share of type 1"),
-    # Initial health distribution (type 1 shift relative to type 0)
-    ("h_init_mu1",  -3.00,  0.50,  "initial health z-shift type 1"),
+    # Initial health distribution (z-space mean per type; h = sigmoid(z))
+    ("z_init_mu0",  -3.00,  3.00,  "initial health z-mean type 0 (z-space)"),
+    ("z_init_mu1",  -3.00,  3.00,  "initial health z-mean type 1 (z-space)"),
+    # Health AR(1) process
+    ("rho_h",        0.50,  0.999, "health AR(1) persistence (monthly)"),
+    ("sigma_h",      0.05,  2.00,  "health innovation std"),
+    # Utility curvature (CRRA: mu=-1 → log, mu=-sigma where sigma=RRA coefficient)
+    ("mu",          -3.00, -0.10,  "CRRA curvature"),
 ]
 
 PARAM_NAMES  = [p[0] for p in PARAM_SPEC]
@@ -298,13 +304,15 @@ class SMMEstimator:
         Override the default PARAM_SPEC list.
     """
 
-    def __init__(self, ModelClass, calibrated=None, param_spec=None):
-        self.ModelClass  = ModelClass
-        self.calibrated  = calibrated or {}
-        self.param_spec  = param_spec or PARAM_SPEC
-        self.param_names = [p[0] for p in self.param_spec]
-        self.param_bounds= [(p[1], p[2]) for p in self.param_spec]
+    def __init__(self, ModelClass, calibrated=None, param_spec=None,
+                 update_w_avg=False):
+        self.ModelClass   = ModelClass
+        self.calibrated   = calibrated or {}
+        self.param_spec   = param_spec or PARAM_SPEC
+        self.param_names  = [p[0] for p in self.param_spec]
+        self.param_bounds = [(p[1], p[2]) for p in self.param_spec]
         self._moment_keys = None   # set on first evaluation
+        self.update_w_avg = update_w_avg  # if True: re-calibrate w_avg at each eval
 
     # ── parameter handling ────────────────────────────────────────────────────
 
@@ -334,8 +342,10 @@ class SMMEstimator:
                 par.nu_grid[1] = val
             elif name == "type_share1":
                 par.type_shares = np.array([1.0 - val, val])
-            elif name == "h_init_mu1":
-                par.h_init_mu[1] = val
+            elif name == "z_init_mu0":
+                par.z_init_mu[0] = val
+            elif name == "z_init_mu1":
+                par.z_init_mu[1] = val
             else:
                 setattr(par, name, val)
 
@@ -352,6 +362,16 @@ class SMMEstimator:
                 model.allocate()   # recompute grids with overridden parameters
             model.solve()
             model.simulate()
+
+            # Step-2 mode: re-calibrate w_avg from simulated model, then re-solve
+            if self.update_w_avg and 'w_avg' in self.calibrated:
+                w_avg_sim = model.avg_wage()
+                if np.isfinite(w_avg_sim) and abs(w_avg_sim - self.calibrated['w_avg']) > 1e-6:
+                    self.calibrated['w_avg'] = w_avg_sim
+                    model = self._build_model(theta)
+                    model.solve()
+                    model.simulate()
+
             return model
         except Exception as e:
             warnings.warn(f"Model failed for theta={theta}: {e}")
@@ -438,8 +458,9 @@ class SMMEstimator:
         W=None,
         theta0=None,
         nm_maxiter=5000,
-        progress_every=5,
         verbose=False,
+        patience=100,
+        patience_tol=1e-6,
     ):
         """
         Estimate parameters by minimising the SMM objective with Nelder-Mead.
@@ -454,10 +475,13 @@ class SMMEstimator:
             Starting values (required).
         nm_maxiter : int
             Max Nelder-Mead iterations.
-        progress_every : int
-            Print best Q every this many function evaluations (0 = off).
         verbose : bool
             Print Q at every single evaluation.
+        patience : int
+            Stop early if best Q has not improved by more than patience_tol
+            over this many consecutive iterations (0 = disabled).
+        patience_tol : float
+            Minimum improvement in Q to reset the patience counter.
 
         Returns
         -------
@@ -470,42 +494,75 @@ class SMMEstimator:
         if theta0 is None:
             raise ValueError("theta0 must be provided")
 
-        _n_evals = [0]
-        _best_Q  = [1e10]
+        _n_iters        = [0]
+        _best_Q         = [1e10]
+        _best_Q_at_iter = [1e10]
+        _no_improve     = [0]
+        _theta_best     = [np.asarray(theta0, dtype=float).copy()]
+
+        lo = np.array([b[0] for b in self.param_bounds])
+        hi = np.array([b[1] for b in self.param_bounds])
 
         def _obj(theta):
-            _n_evals[0] += 1
-            Q = self.objective(theta, data_moments, W, verbose)
+            theta_clipped = np.clip(theta, lo, hi)
+            Q = self.objective(theta_clipped, data_moments, W, verbose)
             if Q < _best_Q[0]:
                 _best_Q[0] = Q
-            if progress_every and _n_evals[0] % progress_every == 0:
-                print(f"  eval {_n_evals[0]:5d}  |  best Q = {_best_Q[0]:.6f}")
+                _theta_best[0] = theta_clipped.copy()
             return Q
 
         def _nm_cb(xk):
-            print(f"  iter {_n_evals[0]:5d} evals  |  best Q = {_best_Q[0]:.6f}")
+            _n_iters[0] += 1
+            print(f"  iter {_n_iters[0]:4d}  |  best Q = {_best_Q[0]:.6f}")
+            # early stopping
+            if patience > 0:
+                if _best_Q_at_iter[0] - _best_Q[0] > patience_tol:
+                    _no_improve[0] = 0
+                    _best_Q_at_iter[0] = _best_Q[0]
+                else:
+                    _no_improve[0] += 1
+                if _no_improve[0] >= patience:
+                    print(f"  Early stop: no improvement in {patience} iterations.")
+                    raise StopIteration
 
-        print(f"Nelder-Mead  ({len(self.param_names)} parameters)")
-        nm_result = minimize(
-            _obj,
-            x0       = np.asarray(theta0, dtype=float),
-            method   = "Nelder-Mead",
-            callback = _nm_cb,
-            options  = {
-                "maxiter":  nm_maxiter,
-                "xatol":    1e-5,
-                "fatol":    1e-6,
-                "disp":     True,
-                "adaptive": True,
-            },
-        )
-        theta_best = nm_result.x
-        print(f"  done: Q = {nm_result.fun:.6f}")
+        # Build initial simplex: theta0 as first vertex, then N vertices each
+        # perturbed by 20% of the parameter range — much larger than scipy's default 5%,
+        # which is too small for 26 parameters on a flat landscape.
+        n_p   = len(self.param_names)
+        t0    = np.asarray(theta0, dtype=float)
+        simplex = np.tile(t0, (n_p + 1, 1))
+        for j in range(n_p):
+            step = 0.20 * (hi[j] - lo[j])
+            simplex[j + 1, j] = np.clip(t0[j] + step, lo[j], hi[j])
+
+        print(f"Nelder-Mead  ({len(self.param_names)} parameters)"
+              f"  patience={patience}")
+        try:
+            nm_result = minimize(
+                _obj,
+                x0       = t0,
+                method   = "Nelder-Mead",
+                callback = _nm_cb,
+                options  = {
+                    "maxiter":        nm_maxiter,
+                    "xatol":          1e-5,
+                    "fatol":          1e-6,
+                    "disp":           False,
+                    "adaptive":       True,
+                    "initial_simplex": simplex,
+                },
+            )
+            theta_best = np.clip(nm_result.x, lo, hi)
+        except StopIteration:
+            theta_best = _theta_best[0]
+            nm_result  = None
+
+        print(f"  done: Q = {_best_Q[0]:.6f}  ({_n_iters[0]} iterations)")
 
         table = self._make_table(theta_best)
         return {
             "theta":     theta_best,
-            "Q":         float(nm_result.fun),
+            "Q":         float(_best_Q[0]),
             "table":     table,
             "nm_result": nm_result,
         }
@@ -673,13 +730,11 @@ class SMMEstimator:
 
     # ── hazard fit plot ───────────────────────────────────────────────────────
 
-    def plot_fit(self, theta, data_moments, figsize=None, override_par=None, ci_dict=None):
+    def plot_fit(self, theta, data_moments, figsize=None, override_par=None,
+                 ci_dict=None, raw_data=None):
         """
         Plot simulated vs empirical hazard rates for every moment group
         present in data_moments.
-
-        Each distinct moment prefix (the part before '_bin') gets its own
-        panel so it is easy to see where the model fits well or poorly.
 
         Parameters
         ----------
@@ -688,13 +743,19 @@ class SMMEstimator:
         figsize : tuple or None  (auto-sized if None)
         ci_dict : dict or None
             {moment_key: (lower, upper)} confidence interval bounds.
-            When provided, a shaded band is drawn around the empirical series.
+        raw_data : dict or None
+            {prefix: DataFrame} mapping e.g. 'hz_se' → original DataFrame with
+            columns 'duration', 'hazard', 'hazard_lower', 'hazard_upper'.
+            When provided, the empirical series and CI band are plotted using
+            the original continuous duration values rather than the integer keys,
+            giving smooth curves matching the data presentation notebook.
 
         Returns
         -------
         matplotlib Figure
         """
         import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
         from collections import defaultdict
 
         model = self._run_model(theta, override_par=override_par)
@@ -729,20 +790,40 @@ class SMMEstimator:
         }
 
         for ax, (prefix, ks) in zip(axes, groups.items()):
-            # Extract duration from key suffix (e.g. 'hz_se_d03' → 3)
-            durations = [int(k.split('_d')[-1]) for k in ks]
-            d_vals    = [data_moments[k] for k in ks]
-            m_vals    = [model_mom[k]    for k in ks]
+            # Integer durations for the model line (always from moment keys)
+            int_durs = [int(k.split('_d')[-1]) for k in ks]
+            m_vals   = [model_mom[k] for k in ks]
 
-            ax.plot(durations, d_vals, '-',  color='darkred',   label='Data',  lw=1.8, ms=5)
-            if ci_dict is not None:
+            # Empirical series: use raw DataFrame if provided (continuous x-axis)
+            # otherwise fall back to integer durations from moment keys
+            df_raw = (raw_data or {}).get(prefix)
+            if df_raw is not None:
+                d_x  = df_raw['duration'].values
+                d_vals = df_raw['hazard'].values
+                lo   = df_raw['hazard_lower'].values if 'hazard_lower' in df_raw.columns else None
+                hi   = df_raw['hazard_upper'].values if 'hazard_upper' in df_raw.columns else None
+            else:
+                d_x    = int_durs
+                d_vals = [data_moments[k] for k in ks]
+                if ci_dict is not None:
+                    lo = [ci_dict[k][0] if k in ci_dict else np.nan for k in ks]
+                    hi = [ci_dict[k][1] if k in ci_dict else np.nan for k in ks]
+                else:
+                    lo = hi = None
+
+            if lo is not None and hi is not None:
+                ax.fill_between(d_x, lo, hi, color='darkred', alpha=0.15, label='95% CI')
+            ax.plot(d_x, d_vals, '-',  color='darkred', label='Data',  lw=1.8)
+            # ci_dict fallback for when raw_data is not provided
+            if df_raw is None and ci_dict is not None and lo is None:
                 lo = [ci_dict[k][0] if k in ci_dict else np.nan for k in ks]
                 hi = [ci_dict[k][1] if k in ci_dict else np.nan for k in ks]
-                ax.fill_between(durations, lo, hi, color='darkred', alpha=0.15)
-            ax.plot(durations, m_vals, '--', color='tan', label='Model', lw=1.8, ms=5)
+                ax.fill_between(int_durs, lo, hi, color='darkred', alpha=0.15)
+            ax.plot(int_durs, m_vals, '--', color='tan', label='Model', lw=1.8)
             ax.set_title(TITLES.get(prefix, prefix.replace('_', ' ')), fontsize=10)
             ax.set_xlabel('Duration (months)', fontsize=9)
             ax.set_ylabel('Hazard rate', fontsize=9)
+            ax.xaxis.set_major_locator(mticker.MultipleLocator(4))
             ax.legend(fontsize=9)
             ax.set_ylim(bottom=0)
             ax.grid(axis='y', alpha=0.3)
